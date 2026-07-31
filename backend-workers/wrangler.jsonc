@@ -1,0 +1,46 @@
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "grc-agentic-workers",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-07-31",
+  "compatibility_flags": ["nodejs_compat"],
+  "observability": { "enabled": true },
+
+  // Non-secret config. Secrets (API keys, passwords, client secret) are set via
+  // `wrangler secret put <NAME>` instead — see Phase 4 in the migration plan.
+  "vars": {
+    "GEMINI_MODEL": "gemini-1.5-flash",
+    "GEMINI_EMBEDDING_MODEL": "gemini-embedding-001",
+    "GEMINI_TIMEOUT_MS": "90000",
+    "GEMINI_TOOL_MAX_TOKENS": "4096",
+    "SERVICENOW_USE_LIVE": "true",
+    "SERVICENOW_INSTANCE_URL": "https://dev192667.service-now.com",
+    "SALESFORCE_USE_LIVE": "true",
+    "SALESFORCE_INSTANCE_URL": "https://wissda2.my.salesforce.com"
+  },
+
+  // Placeholder IDs — replaced after running (Phase 4, requires the user's
+  // authenticated wrangler session):
+  //   wrangler kv namespace create ADAPTER_CONFIGS
+  //   wrangler kv namespace create VECTOR_CACHE
+  "kv_namespaces": [
+    { "binding": "ADAPTER_CONFIGS", "id": "REPLACE_AFTER_KV_NAMESPACE_CREATE" },
+    { "binding": "VECTOR_CACHE", "id": "REPLACE_AFTER_KV_NAMESPACE_CREATE" }
+  ],
+
+  // Placeholder ID — replaced after: wrangler d1 create grc-observability
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "grc-observability",
+      "database_id": "REPLACE_AFTER_D1_CREATE",
+      "migrations_dir": "./migrations"
+    }
+  ],
+
+  "workflows": [
+    { "binding": "CONTROL_EFFECTIVENESS_WORKFLOW", "name": "control-effectiveness", "class_name": "ControlEffectivenessWorkflow" },
+    { "binding": "INHERENT_ASSESSMENT_WORKFLOW", "name": "inherent-assessment", "class_name": "InherentAssessmentWorkflow" },
+    { "binding": "RISK_CONTROL_MAPPING_WORKFLOW", "name": "risk-control-mapping", "class_name": "RiskControlMappingWorkflow" }
+  ]
+}
