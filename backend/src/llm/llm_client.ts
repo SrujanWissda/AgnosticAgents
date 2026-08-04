@@ -169,7 +169,15 @@ export class GeminiLLMClient extends BaseLLMClient {
 
       const parts: any[] = data?.candidates?.[0]?.content?.parts || [];
       if (parts.length === 0) {
-        recordSpan('llm.tool_loop', t0, 'error', { model: this.model, turn, reason: 'empty candidate' });
+        // Gemini occasionally returns an empty response (no text, no tool calls).
+        // Nudge the conversation with a retry prompt rather than failing outright.
+        const finishReason = data?.candidates?.[0]?.finishReason || 'UNKNOWN';
+        console.warn(`[GeminiLLMClient] Empty parts on turn ${turn} (finishReason=${finishReason}). Nudging model to retry.`);
+        if (turn < maxTurns) {
+          contents.push({ role: 'user', parts: [{ text: `Your last response was empty. Please use one of the available tools to continue investigating, or call ${finalAnswerTool} if you have enough evidence.` }] });
+          continue;
+        }
+        recordSpan('llm.tool_loop', t0, 'error', { model: this.model, turn, reason: 'empty candidate after retry' });
         return null;
       }
 

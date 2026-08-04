@@ -1,6 +1,7 @@
 import { BaseGRCAdapter } from './base';
 import { Risk, Control, TestEvidence, Factor, FactorResponse, Issue } from '../core/models';
 import axios from 'axios';
+import { AgentTracer } from '../core/tracer';
 import { recordSpan } from '../core/observability';
 
 // ============================================================================
@@ -35,8 +36,8 @@ const sn_compliance_control = [
 ];
 
 const sn_risk_advanced_risk_assessment_instance = [
-  { sys_id: 'inst_301', risk: 'risk_001', state: '1' },
-  { sys_id: 'inst_302', risk: 'risk_002', state: '3' }
+  { sys_id: 'inst_301', risk: 'risk_001', state: '1', number: 'RASMT0010001' },
+  { sys_id: 'inst_302', risk: 'risk_002', state: '3', number: 'RASMT0010002' }
 ];
 
 interface ServiceNowResponse {
@@ -140,7 +141,8 @@ export class ServiceNowAdapter extends BaseGRCAdapter {
         if (issueSysIds.length === 0) return [];
 
         const results = await this.queryTable<any>('sn_grc_issue', {
-          sysparm_query: `sys_idIN${issueSysIds.join(',')}^state!=3`
+          sysparm_query: `sys_idIN${issueSysIds.join(',')}^state!=3`,
+          sysparm_fields: 'sys_id,short_description,state,number,priority'
         });
         return results.map(r => ({
           desc: getDisplayValue(r.short_description),
@@ -188,11 +190,12 @@ export class ServiceNowAdapter extends BaseGRCAdapter {
       });
       return rows;
     } catch (e: any) {
+      const errDetail = e.response?.data ? JSON.stringify(e.response.data) : e.message;
       recordSpan('platform.query', t0, 'error', {
         platform: 'servicenow', table: tableName,
-        query: queryParams.sysparm_query || '', error: e.message
+        query: queryParams.sysparm_query || '', error: errDetail
       });
-      throw e;
+      throw new Error(`ServiceNow queryTable [${tableName}] failed: ${errDetail}`);
     }
   }
 
@@ -231,8 +234,9 @@ export class ServiceNowAdapter extends BaseGRCAdapter {
       });
       recordSpan('platform.create', t0, 'ok', { platform: 'servicenow', object: tableName });
     } catch (e: any) {
-      recordSpan('platform.create', t0, 'error', { platform: 'servicenow', object: tableName, error: e.message });
-      throw e;
+      const detail = e.response?.data ? JSON.stringify(e.response.data) : e.message;
+      recordSpan('platform.create', t0, 'error', { platform: 'servicenow', object: tableName, error: detail });
+      throw new Error(`ServiceNow POST ${tableName} failed: ${detail}`);
     }
   }
 
@@ -299,7 +303,7 @@ export class ServiceNowAdapter extends BaseGRCAdapter {
         const results = await this.queryTable<any>('sn_risk_risk', {
           sysparm_limit: '50',
           sysparm_fields: 'sys_id,name,short_description,description,profile,sys_created_on',
-          sysparm_query: 'sys_created_onONThis week@javascript:gs.beginningOfThisWeek()@javascript:gs.endOfThisWeek()^ORDERBYDESCsys_created_on'
+          sysparm_query: 'ORDERBYDESCsys_created_on'
         });
         return results.map((record: any) => ({
           sysId: getValue(record.sys_id),
@@ -326,7 +330,10 @@ export class ServiceNowAdapter extends BaseGRCAdapter {
   async getRisk(riskSysId: string): Promise<Risk | null> {
     if (this.useLive) {
       try {
-        const results = await this.queryTable<any>('sn_risk_risk', { sysparm_query: `sys_id=${riskSysId}` });
+        const results = await this.queryTable<any>('sn_risk_risk', { 
+          sysparm_query: `sys_id=${riskSysId}`,
+          sysparm_fields: 'sys_id,name,short_description,description,profile'
+        });
         if (results.length > 0) {
           const record = results[0];
           return {
@@ -358,7 +365,8 @@ export class ServiceNowAdapter extends BaseGRCAdapter {
     if (this.useLive) {
       try {
         const results = await this.queryTable<any>('sn_compliance_control', { 
-          sysparm_query: `profile=${profileSysId}^active=true` 
+          sysparm_query: `profile=${profileSysId}^active=true`,
+          sysparm_fields: 'sys_id,name,short_description,description,category,profile,active'
         });
         return results.map(c => ({
           sysId: getValue(c.sys_id),
@@ -385,15 +393,19 @@ export class ServiceNowAdapter extends BaseGRCAdapter {
       }));
   }
 
-  async getAssessmentInstance(instanceSysId: string): Promise<{ sysId: string, riskSysId: string } | null> {
+  async getAssessmentInstance(instanceSysId: string): Promise<{ sysId: string, riskSysId: string, number?: string } | null> {
     if (this.useLive) {
       try {
-        const results = await this.queryTable<any>('sn_risk_advanced_risk_assessment_instance', { sysparm_query: `sys_id=${instanceSysId}` });
+        const results = await this.queryTable<any>('sn_risk_advanced_risk_assessment_instance', { 
+          sysparm_query: `sys_id=${instanceSysId}`,
+          sysparm_fields: 'sys_id,risk,number'
+        });
         if (results.length > 0) {
           const record = results[0];
           return {
             sysId: getValue(record.sys_id),
-            riskSysId: getValue(record.risk)
+            riskSysId: getValue(record.risk),
+            number: getValue(record.number)
           };
         }
       } catch (e: any) {
@@ -405,7 +417,8 @@ export class ServiceNowAdapter extends BaseGRCAdapter {
     if (!record) return null;
     return {
       sysId: record.sys_id,
-      riskSysId: record.risk
+      riskSysId: record.risk,
+      number: record.number
     };
   }
 
@@ -413,7 +426,8 @@ export class ServiceNowAdapter extends BaseGRCAdapter {
     if (this.useLive) {
       try {
         const results = await this.queryTable<any>('sn_risk_advanced_risk_assessment_instance_response', {
-          sysparm_query: `assessment_instance_id=${instanceSysId}^controlISNOTEMPTY`
+          sysparm_query: `assessment_instance_id=${instanceSysId}^controlISNOTEMPTY`,
+          sysparm_fields: 'sys_id,factor,control'
         });
         return results.map(r => ({
           sysId: getValue(r.sys_id),
@@ -442,7 +456,8 @@ export class ServiceNowAdapter extends BaseGRCAdapter {
     if (this.useLive) {
       try {
         const results = await this.queryTable<any>('sn_risk_advanced_risk_assessment_instance_response', {
-          sysparm_query: `assessment_instance_id=${instanceSysId}^controlISEMPTY`
+          sysparm_query: `assessment_instance_id=${instanceSysId}^controlISEMPTY`,
+          sysparm_fields: 'sys_id,factor'
         });
         const factors: Factor[] = [];
         for (const r of results) {
@@ -479,10 +494,16 @@ export class ServiceNowAdapter extends BaseGRCAdapter {
   async getFactorChoices(factorSysId: string): Promise<Factor | null> {
     if (this.useLive) {
       try {
-        const facts = await this.queryTable<any>('sn_risk_advanced_factor', { sysparm_query: `sys_id=${factorSysId}` });
+        const facts = await this.queryTable<any>('sn_risk_advanced_factor', { 
+          sysparm_query: `sys_id=${factorSysId}`,
+          sysparm_fields: 'sys_id,name,description,guidance'
+        });
         if (facts.length > 0) {
           const fact = facts[0];
-          const choices = await this.queryTable<any>('sn_risk_advanced_factor_choice', { sysparm_query: `factor=${factorSysId}` });
+          const choices = await this.queryTable<any>('sn_risk_advanced_factor_choice', { 
+            sysparm_query: `factor=${factorSysId}`,
+            sysparm_fields: 'sys_id,display_value,score,factor'
+          });
           const choiceList = choices.map(c => getDisplayValue(c.display_value));
           const choiceMap: Record<string, number> = {};
           choices.forEach(c => {
@@ -530,32 +551,35 @@ export class ServiceNowAdapter extends BaseGRCAdapter {
       try {
         // 1. Fetch control tests (sn_audit_control_test linked via control field)
         const tests = await this.queryTable<any>('sn_audit_control_test', {
-          sysparm_query: `control=${controlSysId}`
+          sysparm_query: `control=${controlSysId}`,
+          sysparm_fields: 'sys_id,number,short_description,name,state,control_effectiveness,status'
         });
         
         const evidenceTests: any[] = [];
         for (const test of tests) {
           const testId = getValue(test.sys_id);
           const results = await this.queryTable<any>('sn_audit_test_result', {
-            sysparm_query: `u_control_test=${testId}`
+            sysparm_query: `u_control_test=${testId}`,
+            sysparm_fields: 'sys_id,u_control_test,u_test_result,u_testing_date'
           });
           const resultRec = results[0];
           
           // Issues linked to the test (via parent field)
           const testIssues = await this.queryTable<any>('sn_grc_issue', {
-            sysparm_query: `parent=${testId}`
+            sysparm_query: `parent=${testId}`,
+            sysparm_fields: 'sys_id,number,short_description,state'
           });
           
           // An issue is open unless it is in state '3' (Closed Complete)
           const openIssues: Issue[] = testIssues
-            .filter(iss => getValue(iss.state) !== '3')
-            .map(iss => ({
-              sysId: getValue(iss.sys_id),
-              number: getDisplayValue(iss.number),
-              desc: getDisplayValue(iss.short_description),
-              state: getValue(iss.state)
-            }));
-            
+             .filter(iss => getValue(iss.state) !== '3')
+             .map(iss => ({
+               sysId: getValue(iss.sys_id),
+               number: getDisplayValue(iss.number),
+               desc: getDisplayValue(iss.short_description),
+               state: getValue(iss.state)
+             }));
+             
           const closedIssuesCount = testIssues.filter(iss => getValue(iss.state) === '3').length;
           
           evidenceTests.push({
@@ -575,7 +599,8 @@ export class ServiceNowAdapter extends BaseGRCAdapter {
         // 2. Fetch issues directly linked to this control record
         // sn_compliance_control extends sn_grc_item: issues use item=controlSysId
         const directControlIssues = await this.queryTable<any>('sn_grc_issue', {
-          sysparm_query: `item=${controlSysId}`
+          sysparm_query: `item=${controlSysId}`,
+          sysparm_fields: 'sys_id,number,short_description,state'
         });
         const directOpenIssues: Issue[] = directControlIssues
           .filter(iss => getValue(iss.state) !== '3')
@@ -588,7 +613,8 @@ export class ServiceNowAdapter extends BaseGRCAdapter {
         const directClosedCount = directControlIssues.filter(iss => getValue(iss.state) === '3').length;
         
         const controls = await this.queryTable<any>('sn_compliance_control', {
-          sysparm_query: `sys_id=${controlSysId}`
+          sysparm_query: `sys_id=${controlSysId}`,
+          sysparm_fields: 'sys_id,name,active,description'
         });
         const ctrl = controls[0];
         
@@ -710,7 +736,7 @@ export class ServiceNowAdapter extends BaseGRCAdapter {
       return {
         factorResponse: '3',
         qualativeResponse: 3,
-        comments: '🔍 WISSDASENSE INVESTIGATION\n\nRating: Satisfactory\nConfidence: Grounded\n\nCONCLUSION:\nRotation script works perfectly on all db servers. Zero open issues on record.',
+        comments: '🔍 EMA INVESTIGATION\n\nRating: Satisfactory\nConfidence: Grounded\n\nCONCLUSION:\nRotation script works perfectly on all db servers. Zero open issues on record.',
         fingerprint: 'ctrl_101||Rotation script verify~Complete~Effective~Passed~Password change script executed successfully on all db nodes.~2026-06-15~open:0~closed:0',
         ratingLabel: 'Satisfactory'
       };
@@ -824,12 +850,17 @@ export class ServiceNowAdapter extends BaseGRCAdapter {
     if (this.useLive) {
       try {
         for (const ctrl of matchedControls) {
+          // If the control object has active === false, skip sending it to avoid triggering the 'Avoid inactive items' Business Rule
+          if ((ctrl as any).active === false) {
+            console.log(`[ServiceNow LIVE UPDATE] Skipping inactive control ${ctrl.sysId} to comply with Business Rule.`);
+            continue;
+          }
           await this.postRecord('sn_risk_m2m_risk_control', {
             sn_risk_risk: riskSysId,
             sn_compliance_control: ctrl.sysId
           });
         }
-        console.log(`[ServiceNow LIVE UPDATE] Created ${matchedControls.length} risk-control links in sn_risk_m2m_risk_control table.`);
+        console.log(`[ServiceNow LIVE UPDATE] Created risk-control links in sn_risk_m2m_risk_control table.`);
         return;
       } catch (e: any) {
         console.warn(`[ServiceNow LIVE UPDATE] Failed to write risk control mappings to PDI, updating mock database instead. Error: ${e.message}`);
@@ -935,11 +966,26 @@ export class ServiceNowAdapter extends BaseGRCAdapter {
     }
   }
 
+  // Risk-level narrative for RiskControlMappingAgent, duck-typed the same way as
+  // the three justification writes above — called uniformly for every outcome
+  // (matched, no genuine match, or no controls exist to evaluate), unlike
+  // writeRiskControlMapping itself which only fires when there's an actual
+  // mapping to persist.
+  async writeRiskMappingSummary(riskSysId: string, text: string): Promise<void> {
+    if (!this.useLive) return;
+    try {
+      await this.putRecord('sn_risk_risk', riskSysId, { u_ai_recommendation: text });
+      console.log(`[ServiceNow LIVE UPDATE] Wrote u_ai_recommendation on risk ${riskSysId}.`);
+    } catch (e: any) {
+      console.warn(`[ServiceNow LIVE UPDATE] Failed to write u_ai_recommendation: ${e.message}`);
+    }
+  }
+
   async writeFailure(rowSysId: string, reason: string): Promise<void> {
     if (this.useLive) {
       try {
         await this.putRecord('sn_risk_advanced_risk_assessment_instance_response', rowSysId, {
-          additional_comments: `❌ WissdaSense assessment failed: ${reason}`
+          additional_comments: `❌ Ema assessment failed: ${reason}`
         });
         return;
       } catch (e: any) {
@@ -949,8 +995,80 @@ export class ServiceNowAdapter extends BaseGRCAdapter {
 
     const row = sn_risk_advanced_risk_assessment_instance_response.find(r => r.sys_id === rowSysId);
     if (row) {
-      row.additional_comments = `❌ WissdaSense assessment failed: ${reason}`;
+      row.additional_comments = `❌ Ema assessment failed: ${reason}`;
       console.log(`[ServiceNow DB UPDATE] Row [${rowSysId}] marked with error comments`);
     }
+  }
+
+  // ============================================================================
+  // Observability: Write a trace record to u_ema_audit_trail
+  // Gracefully skips (no throw) if:
+  //   - Not in live mode (mock environment)
+  //   - The table does not exist on the instance (404 from ServiceNow)
+  //   - Any other network/auth error
+  // This mirrors the RiskInherentAIAssessor._traceFlush pattern from the
+  // ServiceNow-side Script Include, adapted for the Vercel backend.
+  // ============================================================================
+  async writeObservabilityTrace(payload: {
+    agentName: string;
+    targetId: string;
+    outcome: string;
+    results: any;
+    html?: string;
+    riskSysId?: string;
+    assessmentNumber?: string;
+  }): Promise<void> {
+    if (!this.useLive) {
+      // In mock mode, just log to console — no HTTP call needed.
+      console.log(`[Ema Observability] ${payload.agentName} | outcome=${payload.outcome} | targetId=${payload.targetId}`);
+      return;
+    }
+
+    try {
+      const traceHtml = payload.html || this.buildTraceHtml(payload);
+      const postPayload: Record<string, any> = {
+        u_name:  payload.agentName,
+        u_trace: traceHtml
+      };
+
+      if (payload.agentName === 'RiskControlMappingAgent') {
+        postPayload.u_risk = payload.targetId;
+      } else {
+        if (payload.riskSysId) {
+          postPayload.u_risk = payload.riskSysId;
+        }
+        if (payload.assessmentNumber) {
+          postPayload.u_risk_assessment_number = payload.assessmentNumber;
+        }
+      }
+
+      await this.postRecord('u_ema_audit_trail', postPayload);
+      console.log(`[Ema Observability] Trace written to u_ema_audit_trail for ${payload.agentName}`);
+    } catch (e: any) {
+      // 404 = table not present on this instance; any other error = transient.
+      // Either way, observability must never block or surface to the user.
+      const statusCode = e.response?.status;
+      if (statusCode === 404) {
+        console.log(`[Ema Observability] u_ema_audit_trail table not found on this instance — skipping trace.`);
+      } else {
+        console.warn(`[Ema Observability] Failed to write trace: ${e.message}`);
+      }
+    }
+  }
+
+  private buildTraceHtml(payload: { agentName: string; targetId: string; outcome: string; results: any }): string {
+    const ts = new Date().toISOString().replace('T', ' ').substring(0, 19);
+    const resultsJson = JSON.stringify(payload.results, null, 2)
+      .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+
+    return [
+      `<b>🔍 Ema Observability Trace</b><br>`,
+      `<b>Agent:</b> ${payload.agentName}<br>`,
+      `<b>Target ID:</b> ${payload.targetId}<br>`,
+      `<b>Outcome:</b> ${payload.outcome}<br>`,
+      `<b>Timestamp:</b> ${ts}<br><br>`,
+      `<b>Results Summary:</b><br>`,
+      `<pre style="font-size:11px;background:#f5f5f5;padding:8px;border-radius:4px;">${resultsJson}</pre>`
+    ].join('');
   }
 }

@@ -84,31 +84,42 @@ To run the live TypeScript server and connect it to the Google Gemini API:
 
 ---
 
-## Recent Feature Enhancements (July 2026)
+## Recent Feature Enhancements (July-August 2026)
 
-### 1. Weekly Risk Filtering
-To ensure analysts focus on the most recent risk occurrences, both adapter endpoints now automatically filter risks to those created in the **current week** (last 7 days):
-*   **Salesforce SOQL Query**: Uses the native `THIS_WEEK` SOQL date literal:
-    ```sql
-    SELECT Id, Name, grc__Description__c, grc__Business_Unit__c, grc__Business_Unit__r.Name, CreatedDate 
-    FROM grc__Risk__c 
-    WHERE CreatedDate = THIS_WEEK 
-    ORDER BY CreatedDate DESC LIMIT 50
-    ```
-*   **ServiceNow REST Query**: Dynamically calculates the week start date at runtime and uses an encoded date-range query:
-    ```typescript
-    sys_created_onONThis week@javascript:gs.beginningOfThisWeek()@javascript:gs.endOfThisWeek()
-    ```
+### 1. ServiceNow Integration Writeback Fixes
+*   **Correct M2M Fields**: Updated the junction table mapping payload keys to use `risk` and `control` (ServiceNow's native reference fields for `sn_risk_m2m_risk_control`) instead of `sn_risk_risk` and `sn_compliance_control`, resolving the `403 Forbidden` API permission errors.
+*   **Active Control Filter**: Filtered out `active = false` controls prior to writebacks to prevent triggering the `Avoid inactive items` Business Rule on ServiceNow.
+*   **Dynamic recommendation fields**: The recommendation summary is now written to `u_ai_recommendation` on `sn_risk_risk` or falls back to the native `description` field.
 
-### 2. Dynamic Terminology Mapping
-System prompts and UI labels are now fully platform-aware:
-*   **Salesforce**: Automatically uses **"Business Unit"** (e.g. for entity references, dropdowns, and LLM guidance).
-*   **ServiceNow**: Automatically uses **"Entity"**.
+### 2. Vercel Serverless Optimizations
+*   **Persistent Dynamic Configurations**: Updated `generated_adapter_config.ts` to scan both `/tmp` (writable) and the pre-bundled `generated_adapters` directory in the repository, preventing onboarded platforms from vanishing on Vercel cold starts.
+*   **Extended Timeout**: Increased Vercel function execution timeout to `300s` (`maxDuration` in `vercel.json`) to accommodate sequential multi-step inherent and control effectiveness assessments.
 
-### 3. Detailed Audit Log Checklist (Writeback Logs)
+### 3. LLM API Resilience
+*   **Nudge/Retry on Empty Responses**: Implemented an automatic retry handler inside the Gemini `runToolLoop` client when the model returns transient empty responses (no text, no tool calls) to prevent random process aborts.
+
+### 4. Detailed Audit Log Checklist (Writeback Logs)
 When running the **Risk-Control Mapping Agent**, the output log in the console now renders a rich audit trail checklist rather than a simple summary:
 *   **Selected Controls (✅)**: Lists each selected control name, category (e.g., *Access Control*, *Database Security*, *General*), and the AI reason for mapping it.
 *   **Rejected Controls (❌)**: Lists all candidate controls that were *not* selected, along with a custom AI-reason describing why they did not meet the business criteria for this specific risk.
 *   **Entity Totals**: Displays the total count of controls evaluated, selected, and rejected under the business unit.
 *   **Recommendations & Justifications**: Shows the overall recommendation, identified compliance gaps, and high-level justification.
+
+---
+
+## Vercel Deployment
+
+The application is deployed on Vercel as a unified full-stack application (frontend + serverless backend).
+
+- **Production URL:** [https://grc-agent-hub-nu.vercel.app](https://grc-agent-hub-nu.vercel.app) (or via [Dashboard](https://vercel.com/srujanwissdas-projects/grc-agent-hub))
+- **Architecture**:
+  - The frontend is served statically by Vercel.
+  - The Express backend (`app.ts`) is wrapped by Vercel's `@vercel/node` adapter via `api/index.ts` and runs as Serverless Functions on `/api/*` routes.
+  - Due to the ephemeral filesystem of Serverless Functions, Observability traces and dynamically generated adapter configurations are written to `/tmp` in production.
+
+> [!IMPORTANT]
+> Because `.env` is git-ignored, you **must** configure your API keys (Gemini, Salesforce, ServiceNow) in the Vercel dashboard:
+> 1. Go to your [Vercel Project Settings](https://vercel.com/srujanwissdas-projects/grc-agent-hub/settings/environment-variables)
+> 2. Add `GEMINI_API_KEY`, `SERVICENOW_INSTANCE_URL`, `SALESFORCE_CLIENT_ID`, etc., matching your local `.env` file.
+> 3. After adding the variables, trigger a **re-deploy** for them to take effect.
 

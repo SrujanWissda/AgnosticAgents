@@ -4,7 +4,9 @@
    and provides a complete client-side GRC simulation fallback.
    ============================================================================ */
 
-const API_BASE = 'http://localhost:3000/api';
+// Use a relative path so the frontend works on both Vercel (where frontend
+// and API are on the same domain) and locally via `vercel dev`.
+const API_BASE = '/api';
 let isStandaloneMode = true;
 
 // Dynamic Data Store for simulation fallback

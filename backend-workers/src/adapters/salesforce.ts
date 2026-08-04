@@ -57,19 +57,22 @@ export class SalesforceAdapter extends BaseGRCAdapter {
   // Cache of scoring category IDs keyed by category name (fetched once per session)
   private scoringCategoryCache: Map<string, string> = new Map();
 
-  constructor() {
+  // Workers has no global `process.env` — these come from the caller (Env
+  // secrets/vars) instead of being read here directly.
+  constructor(useLive: boolean, instanceUrl: string, clientId: string, clientSecret: string) {
     super();
-    this.useLive = process.env.SALESFORCE_USE_LIVE === 'true';
-    this.instanceUrl = (process.env.SALESFORCE_INSTANCE_URL || '').replace(/\/$/, '');
-    this.clientId = process.env.SALESFORCE_CLIENT_ID || '';
-    this.clientSecret = process.env.SALESFORCE_CLIENT_SECRET || '';
+    this.instanceUrl = (instanceUrl || '').replace(/\/$/, '');
+    this.clientId = clientId || '';
+    this.clientSecret = clientSecret || '';
 
-    if (this.useLive && this.instanceUrl && this.clientId) {
+    if (useLive && this.instanceUrl && this.clientId) {
+      this.useLive = true;
       console.log(`[SalesforceAdapter] Configured in LIVE mode for instance: ${this.instanceUrl}`);
-    } else if (this.useLive) {
+    } else if (useLive) {
       console.warn('[SalesforceAdapter] LIVE mode requested but credentials are incomplete. Falling back to mock.');
       this.useLive = false;
     } else {
+      this.useLive = false;
       console.log('[SalesforceAdapter] Running in MOCK/SIMULATION mode.');
     }
   }
@@ -402,7 +405,7 @@ export class SalesforceAdapter extends BaseGRCAdapter {
             `SELECT Id, Name, grc__Description__c, grc__Business_Unit__c, grc__Status__c, grc__Category__c FROM grc__Control__c WHERE grc__Business_Unit__c = '${profileSysId}' AND grc__Status__c IN ('Implemented', 'Not Implemented') LIMIT 50`
           );
         }
-        
+
         // 2. If no controls found for that BU (or no BU specified), fetch general controls catalog
         if (records.length === 0) {
           records = await this.querySOQL<any>(
@@ -645,7 +648,8 @@ export class SalesforceAdapter extends BaseGRCAdapter {
           latestResult: latest?.Testing_Comments__c || latest?.grc__Result__c || 'No test results on record.',
           resultDate: latest?.grc__Date_Of_Test__c || 'N/A',
           openIssues: [],
-          closedIssues: testResults.length
+          closedIssues: testResults.length,
+          tests: [] // Salesforce exposes only the latest result, not a per-test breakdown like ServiceNow's sn_audit_control_test rows
         };
       } catch (e: any) {
         console.warn(`[SalesforceAdapter] Live getControlEvidence failed: ${e.message}. Using mock.`);
@@ -662,7 +666,8 @@ export class SalesforceAdapter extends BaseGRCAdapter {
       latestResult: 'Automated policy auditor confirmed block public access flag is true in org settings.',
       resultDate: '2026-07-10',
       openIssues: [],
-      closedIssues: 2
+      closedIssues: 2,
+      tests: []
     };
   }
 
@@ -815,7 +820,7 @@ export class SalesforceAdapter extends BaseGRCAdapter {
             const newId = await this.restCreate('Risk__Risk_Control_Lookup__c', {
               Risk__Risk__c: riskSysId,
               Risk__Control__c: ctrl.sysId,
-              Risk__Control_Assessment_Justification__c: `[Ema] ${ctrl.reason}`.substring(0, 32768)
+              Risk__Control_Assessment_Justification__c: `[WissdaSense] ${ctrl.reason}`.substring(0, 32768)
             });
             created.push(newId);
           } catch (innerErr: any) {
@@ -843,7 +848,7 @@ export class SalesforceAdapter extends BaseGRCAdapter {
     if (this.useLive) {
       try {
         await this.restUpdate('Risk__Control_Assessment__c', rowSysId, {
-          Risk__Justification__c: `❌ Ema Assessment failed: ${reason}`
+          Risk__Justification__c: `❌ WissdaSense Assessment failed: ${reason}`
         });
       } catch {
         // Best-effort — don't throw on failure write
@@ -852,7 +857,7 @@ export class SalesforceAdapter extends BaseGRCAdapter {
     }
     const row = sf_assessment_factors.find(item => item.Id === rowSysId);
     if (row) {
-      row.Comments__c = `❌ Ema Assessment failed: ${reason}`;
+      row.Comments__c = `❌ WissdaSense Assessment failed: ${reason}`;
       console.log(`[Salesforce DB UPDATE] Object [Assessment_Factor__c] row [${rowSysId}] marked with error comments`);
     }
   }

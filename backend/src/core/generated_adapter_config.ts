@@ -2,7 +2,13 @@ import fs from 'fs';
 import path from 'path';
 import { AgnosticModelName } from './concept_catalog';
 
-const CONFIG_DIR = path.join(__dirname, '..', '..', 'generated_adapters');
+// On Vercel (and other serverless runtimes) the filesystem is read-only
+// except for /tmp. Dynamically onboarded adapter configs go there when
+// running serverless; note they will NOT survive a cold start in that case.
+const IS_SERVERLESS = !!(process.env.VERCEL || process.env.AWS_LAMBDA_FUNCTION_NAME);
+const CONFIG_DIR = IS_SERVERLESS
+  ? '/tmp/grc-generated-adapters'
+  : path.join(__dirname, '..', '..', 'generated_adapters');
 
 export interface FieldMapping {
   sourceField: string;
@@ -71,10 +77,28 @@ export function saveAdapterConfig(config: GeneratedAdapterConfig): string {
   return filePath;
 }
 
+const BUNDLED_DIR = path.join(__dirname, '..', '..', 'generated_adapters');
+
 export function loadAdapterConfig(platformName: string): GeneratedAdapterConfig | null {
-  const filePath = configPathFor(platformName);
-  if (!fs.existsSync(filePath)) return null;
-  return JSON.parse(fs.readFileSync(filePath, 'utf-8')) as GeneratedAdapterConfig;
+  const safeName = platformName.replace(/[^a-zA-Z0-9_-]/g, '_');
+  
+  // Try CONFIG_DIR (/tmp) first
+  const fileInConfig = path.join(CONFIG_DIR, `${safeName}.json`);
+  if (fs.existsSync(fileInConfig)) {
+    try {
+      return JSON.parse(fs.readFileSync(fileInConfig, 'utf-8')) as GeneratedAdapterConfig;
+    } catch (e) {}
+  }
+  
+  // Try BUNDLED_DIR (pre-bundled)
+  const fileInBundled = path.join(BUNDLED_DIR, `${safeName}.json`);
+  if (fs.existsSync(fileInBundled)) {
+    try {
+      return JSON.parse(fs.readFileSync(fileInBundled, 'utf-8')) as GeneratedAdapterConfig;
+    } catch (e) {}
+  }
+  
+  return null;
 }
 
 export function loadAdapterConfigFromPath(filePath: string): GeneratedAdapterConfig | null {
@@ -83,10 +107,35 @@ export function loadAdapterConfigFromPath(filePath: string): GeneratedAdapterCon
 }
 
 export function listAllAdapterConfigs(): GeneratedAdapterConfig[] {
-  if (!fs.existsSync(CONFIG_DIR)) return [];
-  return fs.readdirSync(CONFIG_DIR)
-    .filter(f => f.endsWith('.json'))
-    .map(f => JSON.parse(fs.readFileSync(path.join(CONFIG_DIR, f), 'utf-8')) as GeneratedAdapterConfig);
+  const configsMap = new Map<string, GeneratedAdapterConfig>();
+
+  const loadFromDir = (dir: string) => {
+    if (!fs.existsSync(dir)) return;
+    try {
+      const files = fs.readdirSync(dir);
+      for (const file of files) {
+        if (file.endsWith('.json')) {
+          try {
+            const config = JSON.parse(fs.readFileSync(path.join(dir, file), 'utf-8')) as GeneratedAdapterConfig;
+            if (config && config.platformName) {
+              configsMap.set(config.platformName, config);
+            }
+          } catch (e) {
+            console.error(`[generated_adapter_config] Failed to parse config file ${file} in ${dir}:`, e);
+          }
+        }
+      }
+    } catch (e) {
+      console.error(`[generated_adapter_config] Failed to read dir ${dir}:`, e);
+    }
+  };
+
+  loadFromDir(BUNDLED_DIR);
+  if (CONFIG_DIR !== BUNDLED_DIR) {
+    loadFromDir(CONFIG_DIR);
+  }
+
+  return Array.from(configsMap.values());
 }
 
 export function findTable(config: GeneratedAdapterConfig, model: AgnosticModelName): TableMapping | undefined {

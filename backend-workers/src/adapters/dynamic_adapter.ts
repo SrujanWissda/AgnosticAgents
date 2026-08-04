@@ -705,7 +705,8 @@ export class DynamicAdapter extends BaseGRCAdapter {
       latestResult: 'No test evidence table mapped for this platform.',
       resultDate: '',
       openIssues: [],
-      closedIssues: 0
+      closedIssues: 0,
+      tests: []
     };
 
     const t = this.table('TestEvidence');
@@ -728,7 +729,8 @@ export class DynamicAdapter extends BaseGRCAdapter {
       latestResult: rec.latestResult || 'No test result notes on record.',
       resultDate: rec.resultDate || '',
       openIssues: [],
-      closedIssues: 0
+      closedIssues: 0,
+      tests: []
     };
   }
 
@@ -901,6 +903,6 @@ export class DynamicAdapter extends BaseGRCAdapter {
       console.warn(`[DynamicAdapter:${this.config.platformName}] Row ${rowSysId} failed: ${reason} (no justification field to record it against)`);
       return;
     }
-    await this.restUpdate(t.sourceTableName, rowSysId, { [justificationField]: `❌ Ema assessment failed: ${reason}` });
+    await this.restUpdate(t.sourceTableName, rowSysId, { [justificationField]: `❌ WissdaSense assessment failed: ${reason}` });
   }
 }

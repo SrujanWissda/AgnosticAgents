@@ -18,3 +18,5 @@ backend/generated_adapters/*.json
 # OS
 .DS_Store
 Thumbs.db
+
+.vercel

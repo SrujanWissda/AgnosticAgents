@@ -19,21 +19,27 @@
     "SALESFORCE_INSTANCE_URL": "https://wissda2.my.salesforce.com"
   },
 
-  // Placeholder IDs — replaced after running (Phase 4, requires the user's
-  // authenticated wrangler session):
-  //   wrangler kv namespace create ADAPTER_CONFIGS
-  //   wrangler kv namespace create VECTOR_CACHE
+  // No `id` — Wrangler 4.45+ auto-provisioning. On the first `wrangler deploy`
+  // (run non-interactively by GitHub Actions using CLOUDFLARE_API_TOKEN /
+  // CLOUDFLARE_ACCOUNT_ID), Wrangler creates these KV namespaces via the
+  // Cloudflare API and links them to this Worker — no local `wrangler login`
+  // or manual `wrangler kv namespace create` needed. Cloudflare keeps the
+  // binding-to-resource link server-side, so re-deploying from a fresh CI
+  // checkout (which never sees a written-back id) still reuses the same
+  // namespace instead of creating a duplicate.
   "kv_namespaces": [
-    { "binding": "ADAPTER_CONFIGS", "id": "REPLACE_AFTER_KV_NAMESPACE_CREATE" },
-    { "binding": "VECTOR_CACHE", "id": "REPLACE_AFTER_KV_NAMESPACE_CREATE" }
+    { "binding": "ADAPTER_CONFIGS" },
+    { "binding": "VECTOR_CACHE" }
   ],
 
-  // Placeholder ID — replaced after: wrangler d1 create grc-observability
+  // Same auto-provisioning behavior for D1 — `database_id` omitted. The table
+  // schema itself still needs an explicit `wrangler d1 migrations apply
+  // --remote` step (auto-provisioning only creates the empty database), which
+  // the deploy workflow runs right after `wrangler deploy`.
   "d1_databases": [
     {
       "binding": "DB",
       "database_name": "grc-observability",
-      "database_id": "REPLACE_AFTER_D1_CREATE",
       "migrations_dir": "./migrations"
     }
   ],

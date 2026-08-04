@@ -1,13 +1,14 @@
 import { BaseGRCAdapter } from '../adapters/base';
 import { BaseLLMClient, ToolDeclaration } from '../llm/llm_client';
 import { Risk, Control, TestEvidence, Factor, MappingResult } from './models';
+import { AgentTracer } from './tracer';
 
 // ============================================================================
 // Helper: Determinstic Evidence Fingerprinting
 // ============================================================================
 function buildEvidenceFingerprint(evidence: TestEvidence): string {
   const parts: string[] = [evidence.sysId];
-  
+
   // Cast and read internal tests sub-evidence if present
   const tests: any[] = (evidence as any).tests || [];
   for (const t of tests) {
@@ -26,30 +27,73 @@ function buildEvidenceFingerprint(evidence: TestEvidence): string {
       ].join('~')
     );
   }
-  
+
+
   return parts.sort().join('||');
+}
+
+// Helper: run asynchronous task on items in parallel batches with a concurrency limit
+async function runInParallelBatches<T, R>(items: T[], batchSize: number, fn: (item: T) => Promise<R>): Promise<R[]> {
+  const results: R[] = [];
+  for (let i = 0; i < items.length; i += batchSize) {
+    const batch = items.slice(i, i + batchSize);
+    const batchResults = await Promise.all(batch.map(item => fn(item)));
+    results.push(...batchResults);
+  }
+  return results;
+}
+
+// Helper: retry a tool-calling loop before giving up. A transient Gemini/network
+// hiccup on one attempt no longer means the item falls straight to a "please
+// retry" placeholder — it gets one more full attempt first. Only retries on a
+// null result (loop didn't finalize); never re-runs a successful attempt.
+async function withRetry<T>(fn: () => Promise<T | null>, attempts: number): Promise<T | null> {
+  for (let i = 0; i < attempts; i++) {
+    const result = await fn();
+    if (result) return result;
+  }
+  return null;
 }
 
 // ============================================================================
 // 1. Control Effectiveness Agent
 // ============================================================================
 export class ControlEffectivenessAgent {
-  constructor(private adapter: BaseGRCAdapter, private llm: BaseLLMClient) {}
+  constructor(private adapter: BaseGRCAdapter, private llm: BaseLLMClient) { }
 
   async execute(instanceSysId: string): Promise<{ success: boolean; message: string; details: any[] }> {
+    const tracer = new AgentTracer();
+    tracer.log('START', { instanceSysId });
+
     const inst = await this.adapter.getAssessmentInstance(instanceSysId);
-    if (!inst) return { success: false, message: 'Assessment instance not found', details: [] };
+    if (!inst) {
+      tracer.log('ERROR', { error: 'Assessment instance not found' });
+      return { success: false, message: 'Assessment instance not found', details: [] };
+    }
+
+    tracer.log('INFO', { instanceSysId: inst.sysId, number: inst.number || 'none', riskSysId: inst.riskSysId });
 
     const risk = await this.adapter.getRisk(inst.riskSysId);
-    if (!risk) return { success: false, message: 'Linked risk not found', details: [] };
+    if (!risk) {
+      tracer.log('ERROR', { error: 'Linked risk not found' });
+      return { success: false, message: 'Linked risk not found', details: [] };
+    }
+
+    tracer.log('INFO', { name: risk.name, profile: risk.profileName });
 
     // Use the resolved instance id (see InherentAssessmentAgent note).
     const rows = await this.adapter.getControlFactorRows(inst.sysId);
+    tracer.log('INFO', { count: rows.length });
     if (rows.length === 0) {
+      tracer.log('END', { outcome: 'no control responses' });
       return { success: false, message: 'No control-linked responses found', details: [] };
     }
 
+    const uniqueControls = new Set(rows.map(r => r.controlSysId).filter(Boolean));
+    tracer.log('INFO', { controlCount: uniqueControls.size });
+
     const priorInstanceSysId = await this.adapter.getPriorClosedAssessment(inst.riskSysId, instanceSysId);
+    tracer.log('INFO', { priorNumber: priorInstanceSysId ? priorInstanceSysId.number : 'none' });
     const results: any[] = [];
     const toAssess: any[] = [];
 
@@ -67,12 +111,13 @@ export class ControlEffectivenessAgent {
             row.sysId,
             carriedScore,
             prior.ratingLabel,
-            `📋 WISSDASENSE — Carried forward. No changes in control or tests since last assessment.\nRating: ${prior.ratingLabel}\nPrior reasoning: ${prior.comments}`,
+            `📋 EMA — Carried forward. No changes in control or tests since last assessment.\nRating: ${prior.ratingLabel}\nPrior reasoning: ${prior.comments}`,
             prior.comments,
             prior.comments,
             fingerprint
           );
           results.push({ control: row.controlName, action: 'copied', rating: prior.ratingLabel, justification: prior.comments });
+          tracer.log('COPIED', { control: row.controlName, rating: prior.ratingLabel, justification: prior.comments });
           continue;
         }
       }
@@ -94,9 +139,13 @@ export class ControlEffectivenessAgent {
         fingerprint,
         factorDetails
       });
+      const tests = (evidence as any).tests || [];
+      const openIssuesCount = (evidence.openIssues?.length || 0) + (tests.reduce((sum: number, t: any) => sum + (t.openIssues?.length || 0), 0) || 0);
+      tracer.log('QUEUED', { control: row.controlName, testCount: tests.length, openIssueCount: openIssuesCount });
     }
 
     if (toAssess.length > 0) {
+      tracer.log('BATCH', { label: 'batch_1', controls: toAssess.map(item => item.controlName).join(', ') });
       // ── Pass 1: draft assessment — one tool-calling loop per control ──
       // Each control is its own investigation: the model is handed nothing but the
       // risk/control names and the valid rating scale, and must actively call tools
@@ -107,20 +156,33 @@ export class ControlEffectivenessAgent {
       // evidence dump upfront regardless of what the model actually needed.
       const drafts: Array<{ item: any; rating: string; score: number; justification: string; toolCallLog?: Array<{ name: string; args: any }> }> = [];
 
-      for (const item of toAssess) {
+      const batchResults = await runInParallelBatches(toAssess, 5, async (item) => {
         if (!item.factorDetails) {
           await this.adapter.writeFailure(item.rowSysId, 'Factor rating scale not configured.');
-          continue;
+          tracer.log('ERROR', { control: item.controlName, error: 'Factor rating scale not configured.' });
+          return { success: false, item, error: 'Factor rating scale not configured.' };
         }
 
-        const draftResult = await this.assessControlWithTools(risk, item, priorInstanceSysId);
+        const draftResult = await withRetry(() => this.assessControlWithTools(risk, item, priorInstanceSysId, tracer), 2);
         if (!draftResult) {
           await this.adapter.writeFailure(item.rowSysId, 'AI tool-calling investigation did not finalize a rating.');
-          results.push({ control: item.controlName, action: 'failed', error: 'tool loop did not finalize' });
-          continue;
+          tracer.log('ERROR', { control: item.controlName, error: 'tool loop did not finalize' });
+          return { success: false, item, error: 'tool loop did not finalize' };
         }
 
-        drafts.push({ item, ...draftResult });
+        return { success: true, item, draftResult };
+      });
+
+      for (const r of batchResults) {
+        if (!r.success) {
+          if (r.error === 'tool loop did not finalize') {
+            results.push({ control: r.item.controlName, action: 'failed', error: 'tool loop did not finalize' });
+          }
+          continue;
+        }
+        const draftResult = r.draftResult!;
+        drafts.push({ item: r.item, ...draftResult });
+        tracer.log('RESULT', { control: r.item.controlName, rating: draftResult.rating, score: draftResult.score, justification: draftResult.justification });
       }
 
       // ── Pass 2: self-critique — a second, independent reviewer pass over the
@@ -130,10 +192,17 @@ export class ControlEffectivenessAgent {
       // leaves every draft exactly as-is, so this pass can only improve or confirm
       // the result, never block or degrade it. ──
       if (drafts.length > 0) {
-        await this.critiqueDrafts(drafts);
+        const critiqueChunkSize = 5;
+        const critiqueChunks: (typeof drafts)[] = [];
+        for (let i = 0; i < drafts.length; i += critiqueChunkSize) {
+          critiqueChunks.push(drafts.slice(i, i + critiqueChunkSize));
+        }
+        // Each chunk reviews a disjoint slice of drafts and mutates only its own
+        // items in place — safe to run concurrently instead of one chunk at a time.
+        await Promise.all(critiqueChunks.map(chunk => this.critiqueDrafts(chunk, tracer)));
       }
 
-      for (const draft of drafts) {
+      await Promise.all(drafts.map(async (draft) => {
         const item = draft.item;
         const controlLevelIssues: any[] = item.evidence.openIssues || [];
         const tests: any[] = (item.evidence as any).tests || [];
@@ -176,7 +245,7 @@ export class ControlEffectivenessAgent {
         // 1. Human-readable comment → additional_comments
         // ============================================================
         const summary = [
-          '🔍 WISSDASENSE INVESTIGATION — Control Effectiveness Assessment',
+          '🔍 EMA INVESTIGATION — Control Effectiveness Assessment',
           '',
           `Rating: ${draft.rating}`,
           `Confidence: ${confidence}`,
@@ -190,7 +259,7 @@ export class ControlEffectivenessAgent {
           'CONCLUSION:',
           draft.justification,
           '',
-          `Model: gemini-3.5-flash (WissdaSense) · Assessed: ${formattedDate}`
+          `Model: gemini-3.5-flash (Ema) · Assessed: ${formattedDate}`
         ].join('\n');
 
         // ============================================================
@@ -201,7 +270,7 @@ export class ControlEffectivenessAgent {
           : 'TOOLS THE AGENT CHOSE TO CALL: none — finalized from the risk/control context alone';
 
         const auditTrail = [
-          `🔍 WISSDASENSE INVESTIGATION (TECHNICAL / AUDIT TRAIL) — Control Effectiveness Assessment`,
+          `🔍 EMA INVESTIGATION (TECHNICAL / AUDIT TRAIL) — Control Effectiveness Assessment`,
           `Rating: ${draft.rating}`,
           `Confidence: ${confidence}`,
           toolsUsedLine,
@@ -212,7 +281,7 @@ export class ControlEffectivenessAgent {
           `&nbsp;&nbsp;4. Prior assessment history — searched ${priorLineTech}`,
           `CONCLUSION:`,
           draft.justification,
-          `Model: gemini-3.5-flash (WissdaSense) · Assessed: ${formattedDate}`
+          `Model: gemini-3.5-flash (Ema) · Assessed: ${formattedDate}`
         ].join('<br><br>').replace(
           // Add single <br> between Rating and Confidence (they should sit together)
           `Rating: ${draft.rating}<br><br>Confidence: ${confidence}`,
@@ -230,7 +299,7 @@ export class ControlEffectivenessAgent {
         );
 
         results.push({ control: item.controlName, action: 'assessed', rating: draft.rating, justification: draft.justification });
-      }
+      }));
     }
 
     // Optional: instance-level justification synthesis (control summary + residual).
@@ -242,6 +311,25 @@ export class ControlEffectivenessAgent {
     const getContext = (this.adapter as any).getInstanceJustificationContext;
     if (typeof getContext === 'function') {
       await this.synthesizeInstanceJustifications(inst.sysId, results, getContext);
+    }
+
+    // ── Observability: write a trace record to u_ema_audit_trail if adapter supports it ──
+    const outcome = results.every(r => r.action !== 'failed') ? 'assessed' : 'partial';
+    tracer.log('END', { outcome });
+
+    const writeTrace = (this.adapter as any).writeObservabilityTrace;
+    if (typeof writeTrace === 'function') {
+      try {
+        await writeTrace.call(this.adapter, {
+          agentName: 'ControlEffectivenessAgent',
+          targetId: instanceSysId,
+          outcome,
+          results,
+          html: tracer.renderHtml('ControlEffectivenessAgent', inst.number || instanceSysId),
+          riskSysId: inst.riskSysId,
+          assessmentNumber: inst.number
+        });
+      } catch (_) { /* observability is best-effort — never block the run */ }
     }
 
     return {
@@ -278,7 +366,7 @@ export class ControlEffectivenessAgent {
       properties: { summary: { type: 'STRING' } },
       required: ['summary']
     };
-    const systemInstruction = 'You are WissdaSense, a GRC compliance-narrative writer.';
+    const systemInstruction = 'You are Ema, a GRC compliance-narrative writer.';
 
     const calcRating = context.calculatedRatings.find(r => r.startsWith('control effectiveness'));
     const calcBlock = context.calculatedRatings.length
@@ -290,7 +378,7 @@ export class ControlEffectivenessAgent {
     let controlJustification = '';
     try {
       const controlPrompt = [
-        'You are WissdaSense, writing an executive summary for a compliance manager reviewing',
+        'You are Ema, writing an executive summary for a compliance manager reviewing',
         'control effectiveness ratings tied to one risk.',
         '',
         lines,
@@ -324,7 +412,7 @@ export class ControlEffectivenessAgent {
     let residualJustification = '';
     try {
       const residualPrompt = [
-        'You are WissdaSense, writing a RESIDUAL RISK summary for a compliance manager.',
+        'You are Ema, writing a RESIDUAL RISK summary for a compliance manager.',
         'Residual risk = what remains after the effectiveness of controls is applied against',
         'the inherent risk.',
         '',
@@ -381,7 +469,7 @@ export class ControlEffectivenessAgent {
       return {
         rating: lowestLabel,
         score: factorDetails.choiceMap[lowestLabel],
-        justification: `WissdaSense returned out-of-scale rating ("${rawRating}"). Defaulted to lowest option (${lowestLabel}). Original rationale: ${rawJustification}`
+        justification: `Ema returned out-of-scale rating ("${rawRating}"). Defaulted to lowest option (${lowestLabel}). Original rationale: ${rawJustification}`
       };
     }
 
@@ -394,7 +482,7 @@ export class ControlEffectivenessAgent {
   // independent opinion. This is what makes it a reflection step rather than
   // just re-running the same prompt twice: the model is told what was already
   // concluded and asked to find fault with it specifically.
-  private async critiqueDrafts(drafts: Array<{ item: any; rating: string; score: number; justification: string }>): Promise<void> {
+  private async critiqueDrafts(drafts: Array<{ item: any; rating: string; score: number; justification: string }>, tracer: AgentTracer): Promise<void> {
     const blocks = drafts.map((d, idx) => {
       const item = d.item;
       const tests: any[] = item.evidence.tests || [];
@@ -410,7 +498,7 @@ export class ControlEffectivenessAgent {
     }).join('\n\n');
 
     const prompt = [
-      'You are WissdaSense, now reviewing your own draft control-effectiveness ratings as a second, independent pass.',
+      'You are Ema, now reviewing your own draft control-effectiveness ratings as a second, independent pass.',
       'For each control below, a first pass already produced a draft rating and justification from the evidence shown.',
       'Check whether the draft rating actually follows from that evidence — not whether you would phrase it differently.',
       '',
@@ -446,12 +534,22 @@ export class ControlEffectivenessAgent {
       required: ['reviews']
     };
 
+    tracer.log('REQUEST', {
+      phase: 'critique',
+      prompt_preview: prompt
+    });
+
     try {
       const response = await this.llm.generateStructuredOutput<{ reviews: Array<{ index: number; action: string; rating: string; note?: string }> }>(
         prompt,
-        'You are WissdaSense, acting as an independent second reviewer of draft GRC ratings.',
+        'You are Ema, acting as an independent second reviewer of draft GRC ratings.',
         schema
       );
+      tracer.log('RESPONSE', {
+        phase: 'critique',
+        status: 'completed',
+        reviews: response.reviews
+      });
       for (const review of response.reviews || []) {
         const draft = drafts[review.index - 1];
         if (!draft || review.action !== 'revise') continue;
@@ -460,10 +558,11 @@ export class ControlEffectivenessAgent {
         draft.score = resolved.score;
         draft.justification = `${draft.justification}\n\n🔁 Revised on second-pass review: ${review.note || 'rating did not hold up against the evidence on review.'}`;
       }
-    } catch (e) {
+    } catch (e: any) {
       // Critique is an enrichment pass — a failed or unparseable review leaves
       // every draft exactly as the first pass produced it, rather than blocking
       // or corrupting the run.
+      tracer.log('ERROR', { phase: 'critique', error: e.message });
     }
   }
 
@@ -478,7 +577,8 @@ export class ControlEffectivenessAgent {
   private async assessControlWithTools(
     risk: Risk,
     item: any,
-    priorInstanceSysId: { sysId: string; number: string } | null
+    priorInstanceSysId: { sysId: string; number: string } | null,
+    tracer: AgentTracer
   ): Promise<{ rating: string; score: number; justification: string; toolCallLog: Array<{ name: string; args: any }> } | null> {
     const factorDetails: Factor = item.factorDetails;
     const choiceStr = Object.keys(factorDetails.choiceMap).join(', ');
@@ -588,8 +688,13 @@ export class ControlEffectivenessAgent {
       'citing the specific evidence that drove it.'
     ].join('\n');
 
+    tracer.log('REQUEST', {
+      control: item.controlName,
+      prompt_preview: initialPrompt
+    });
+
     const loop = await this.llm.runToolLoop<{ rating: string; justification: string }>(
-      'You are WissdaSense, a GRC control-effectiveness assessment agent. You investigate before you conclude: gather evidence via the available tools, then submit exactly one final assessment.',
+      'You are Ema, a GRC control-effectiveness assessment agent. You investigate before you conclude: gather evidence via the available tools, then submit exactly one final assessment.',
       initialPrompt,
       tools,
       'submit_assessment',
@@ -597,7 +702,16 @@ export class ControlEffectivenessAgent {
       6
     );
 
-    if (!loop) return null;
+    if (!loop) {
+      tracer.log('ERROR', { control: item.controlName, error: 'tool loop did not finalize' });
+      return null;
+    }
+
+    tracer.log('RESPONSE', {
+      control: item.controlName,
+      rating: loop.result.rating,
+      justification: loop.result.justification
+    });
 
     const resolved = this.resolveRating(factorDetails, loop.result.rating, loop.result.justification);
     return { rating: resolved.rating, score: resolved.score, justification: resolved.justification, toolCallLog: loop.toolCallLog };
@@ -608,20 +722,35 @@ export class ControlEffectivenessAgent {
 // 2. Inherent Assessment Agent
 // ============================================================================
 export class InherentAssessmentAgent {
-  constructor(private adapter: BaseGRCAdapter, private llm: BaseLLMClient) {}
+  constructor(private adapter: BaseGRCAdapter, private llm: BaseLLMClient) { }
 
   async execute(instanceSysId: string): Promise<{ success: boolean; message: string; details: any[] }> {
+    const tracer = new AgentTracer();
+    tracer.log('START', { instanceSysId });
+
     const inst = await this.adapter.getAssessmentInstance(instanceSysId);
-    if (!inst) return { success: false, message: 'Assessment instance not found', details: [] };
+    if (!inst) {
+      tracer.log('ERROR', { error: 'Assessment instance not found' });
+      return { success: false, message: 'Assessment instance not found', details: [] };
+    }
+
+    tracer.log('INFO', { instanceSysId: inst.sysId, number: inst.number || 'none', riskSysId: inst.riskSysId });
 
     const risk = await this.adapter.getRisk(inst.riskSysId);
-    if (!risk) return { success: false, message: 'Linked risk not found', details: [] };
+    if (!risk) {
+      tracer.log('ERROR', { error: 'Linked risk not found' });
+      return { success: false, message: 'Linked risk not found', details: [] };
+    }
+
+    tracer.log('INFO', { name: risk.name, profile: risk.profileName });
 
     // Use the RESOLVED instance id — for create-on-demand platforms
     // (Salesforce inherent flow) the caller passes a risk id and
     // getAssessmentInstance returns the freshly created assessment.
     const factors = await this.adapter.getAnswerableManualRows(inst.sysId);
+    tracer.log('INFO', { factorCount: factors.length });
     if (factors.length === 0) {
+      tracer.log('END', { outcome: 'no inherent factors' });
       return { success: false, message: 'No answerable factors found', details: [] };
     }
 
@@ -636,6 +765,7 @@ export class InherentAssessmentAgent {
     // — unlike Control Effectiveness, which fingerprints each control individually
     // because its evidence genuinely does change run to run.
     const priorInstanceSysId = await this.adapter.getPriorClosedAssessment(inst.riskSysId, instanceSysId);
+    tracer.log('INFO', { priorNumber: priorInstanceSysId ? priorInstanceSysId.number : 'none' });
     if (priorInstanceSysId) {
       for (const factor of factors) {
         const prior = await this.adapter.getPriorControlAnswer(priorInstanceSysId.sysId, '', factor.factorSysId);
@@ -646,13 +776,15 @@ export class InherentAssessmentAgent {
             carriedScore,
             prior.ratingLabel,
             prior.comments,
-            `📋 WISSDASENSE — Carried forward from prior closed assessment${priorInstanceSysId.number ? ' ' + priorInstanceSysId.number : ''}. No fresh evaluation this cycle.\nRating: ${prior.ratingLabel}\nPrior reasoning: ${prior.comments}`,
+            `📋 EMA — Carried forward from prior closed assessment${priorInstanceSysId.number ? ' ' + priorInstanceSysId.number : ''}. No fresh evaluation this cycle.\nRating: ${prior.ratingLabel}\nPrior reasoning: ${prior.comments}`,
             prior.comments
           );
           results.push({ factor: factor.factorName, action: 'copied', rating: prior.ratingLabel, justification: prior.comments });
+          tracer.log('COPIED', { factor: factor.factorName, rating: prior.ratingLabel, justification: prior.comments });
         } else {
           await this.adapter.writeFailure(factor.sysId, 'No prior value available to carry forward.');
           results.push({ factor: factor.factorName, rating: null, error: 'no prior value to copy' });
+          tracer.log('ERROR', { factor: factor.factorName, error: 'no prior value to copy' });
         }
       }
 
@@ -670,11 +802,32 @@ export class InherentAssessmentAgent {
         await finalizeCopied.call(this.adapter, inst.sysId);
       }
 
+      tracer.log('END', { outcome: 'copied' });
+
+      // Write trace for copied assessment
+      const writeTraceI = (this.adapter as any).writeObservabilityTrace;
+      if (typeof writeTraceI === 'function') {
+        try {
+          await writeTraceI.call(this.adapter, {
+            agentName: 'InherentAssessmentAgent',
+            targetId: instanceSysId,
+            outcome: 'copied',
+            results,
+            html: tracer.renderHtml('InherentAssessmentAgent', inst.number || instanceSysId)
+          });
+        } catch (_) { /* observability is best-effort — never block the run */ }
+      }
+
       return { success: true, message: `Copied ${results.length} inherent factor(s) from prior closed assessment.`, details: results };
     }
 
     // ── Fresh assessment: entity issue signal, shared context for every factor ──
     const entityIssues = await this.adapter.getEntityIssues(risk.profileSysId || '');
+    tracer.log('INFO', { entityIssuesCount: entityIssues.length });
+
+    for (const factor of factors) {
+      tracer.log('QUEUED', { factor: factor.factorName, choiceList: factor.choiceList });
+    }
 
     // ── Pass 1: draft assessment — one tool-calling loop per factor ──
     // Each factor is its own investigation: the model starts knowing only the risk and
@@ -693,25 +846,40 @@ export class InherentAssessmentAgent {
       toolCallLog?: Array<{ name: string; args: any }>;
     }> = [];
 
-    for (const factor of factors) {
-      const draftResult = await this.assessFactorWithTools(risk, factor, entityIssues, entityLabel, isSalesforce);
+    const batchResults = await runInParallelBatches(factors, 5, async (factor) => {
+      const draftResult = await withRetry(() => this.assessFactorWithTools(risk, factor, entityIssues, entityLabel, isSalesforce, tracer), 2);
       if (!draftResult) {
         await this.adapter.writeFailure(factor.sysId, 'AI tool-calling investigation did not finalize a rating.');
-        results.push({ factor: factor.factorName, rating: null, error: 'tool loop did not finalize' });
+        tracer.log('ERROR', { factor: factor.factorName, error: 'tool loop did not finalize' });
+        return { success: false, factor, error: 'tool loop did not finalize' };
+      }
+      return { success: true, factor, draftResult };
+    });
+
+    for (const r of batchResults) {
+      if (!r.success) {
+        results.push({ factor: r.factor.factorName, rating: null, error: r.error });
         continue;
       }
-      drafts.push({ factor, ...draftResult });
+      const draftResult = r.draftResult!;
+      drafts.push({ factor: r.factor, ...draftResult });
+      tracer.log('RESULT', { factor: r.factor.factorName, rating: draftResult.rating, score: draftResult.score, justification: draftResult.justification });
     }
 
     // ── Pass 2: self-critique — a second, independent reviewer pass, same pattern
     // as Control Effectiveness: explicitly told what the first pass concluded and
     // asked to find fault with it, not just re-answer fresh. ──
     if (drafts.length > 0) {
-      await this.critiqueFactorDrafts(drafts);
+      const critiqueChunkSize = 5;
+      const critiqueChunks: (typeof drafts)[] = [];
+      for (let i = 0; i < drafts.length; i += critiqueChunkSize) {
+        critiqueChunks.push(drafts.slice(i, i + critiqueChunkSize));
+      }
+      await Promise.all(critiqueChunks.map(chunk => this.critiqueFactorDrafts(chunk, tracer)));
     }
 
     // ── Finalize: write each factor's response ──
-    for (const draft of drafts) {
+    await Promise.all(drafts.map(async (draft) => {
       const factor = draft.factor;
       const formattedDate = new Date().toISOString().replace('T', ' ').substring(0, 19);
       const issueCount = entityIssues.length;
@@ -742,7 +910,7 @@ export class InherentAssessmentAgent {
         : 'TOOLS THE AGENT CHOSE TO CALL: none — finalized from the risk/factor context alone';
 
       const comment = [
-        '🔍 WISSDASENSE INVESTIGATION — Inherent Risk Factor Assessment',
+        '🔍 EMA INVESTIGATION — Inherent Risk Factor Assessment',
         '',
         `Rating: ${draft.rating}`,
         `Confidence: ${confidence}`,
@@ -754,11 +922,11 @@ export class InherentAssessmentAgent {
         'CONCLUSION:',
         draft.justification,
         '',
-        `Model: gemini-3.5-flash (WissdaSense) · Assessed: ${formattedDate}`
+        `Model: gemini-3.5-flash (Ema) · Assessed: ${formattedDate}`
       ].join('\n');
 
       const auditTrail = [
-        `🔍 WISSDASENSE INVESTIGATION (TECHNICAL / AUDIT TRAIL) — Inherent Risk Factor Assessment`,
+        `🔍 EMA INVESTIGATION (TECHNICAL / AUDIT TRAIL) — Inherent Risk Factor Assessment`,
         `Rating: ${draft.rating}`,
         `Confidence: ${confidence}`,
         toolsUsedLine,
@@ -767,7 +935,7 @@ export class InherentAssessmentAgent {
         `&nbsp;&nbsp;2. Relevant issues — ${issueRelevanceLine}`,
         `CONCLUSION:`,
         draft.justification,
-        `Model: gemini-3.5-flash (WissdaSense) · Assessed: ${formattedDate}`
+        `Model: gemini-3.5-flash (Ema) · Assessed: ${formattedDate}`
       ].join('<br><br>').replace(
         `Rating: ${draft.rating}<br><br>Confidence: ${confidence}`,
         `Rating: ${draft.rating}<br>Confidence: ${confidence}`
@@ -785,7 +953,7 @@ export class InherentAssessmentAgent {
         auditTrail
       );
       results.push({ factor: factor.factorName, rating: draft.rating, score: draft.score, justification: draft.justification });
-    }
+    }));
 
     // ── Instance-level narrative synthesis (inherent_justification) — duck-typed,
     // only runs where the adapter models this concept (see servicenow.ts). Reuses
@@ -809,6 +977,25 @@ export class InherentAssessmentAgent {
     const finalize = (this.adapter as any).finalizeInherentAssessment;
     if (typeof finalize === 'function') {
       await finalize.call(this.adapter, inst.sysId);
+    }
+
+    // ── Observability: write a trace record to u_ema_audit_trail if adapter supports it ──
+    const outcome = results.every(r => !r.error) ? 'assessed' : 'partial';
+    tracer.log('END', { outcome });
+
+    const writeTraceI = (this.adapter as any).writeObservabilityTrace;
+    if (typeof writeTraceI === 'function') {
+      try {
+        await writeTraceI.call(this.adapter, {
+          agentName: 'InherentAssessmentAgent',
+          targetId: instanceSysId,
+          outcome,
+          results,
+          html: tracer.renderHtml('InherentAssessmentAgent', inst.number || instanceSysId),
+          riskSysId: inst.riskSysId,
+          assessmentNumber: inst.number
+        });
+      } catch (_) { /* observability is best-effort — never block the run */ }
     }
 
     return {
@@ -840,7 +1027,8 @@ export class InherentAssessmentAgent {
     factor: any,
     entityIssues: Array<{ desc: string; state: string; number?: string; priority?: string }>,
     entityLabel: string,
-    isSalesforce: boolean
+    isSalesforce: boolean,
+    tracer: AgentTracer
   ): Promise<{ rating: string; score: number; justification: string; issueRelevant: boolean; relevantIssues: string[]; issueNote: string; toolCallLog: Array<{ name: string; args: any }> } | null> {
     const choiceStr = factor.choiceList.join(', ');
 
@@ -924,8 +1112,13 @@ export class InherentAssessmentAgent {
       'or weren\'t relevant); and justification (1-2 sentences, under 300 characters, citing the rubric band and basis).'
     ].join('\n');
 
+    tracer.log('REQUEST', {
+      factor: factor.factorName,
+      prompt_preview: initialPrompt
+    });
+
     const loop = await this.llm.runToolLoop<{ rating: string; issue_relevant: boolean; relevant_issues?: string[]; issue_note?: string; justification: string }>(
-      'You are WissdaSense, an inherent risk factor evaluator. You investigate before you conclude: gather the rubric and issue context via the available tools, then submit exactly one final rating.',
+      'You are Ema, an inherent risk factor evaluator. You investigate before you conclude: gather the rubric and issue context via the available tools, then submit exactly one final rating.',
       initialPrompt,
       tools,
       'submit_rating',
@@ -933,7 +1126,16 @@ export class InherentAssessmentAgent {
       5
     );
 
-    if (!loop) return null;
+    if (!loop) {
+      tracer.log('ERROR', { factor: factor.factorName, error: 'tool loop did not finalize' });
+      return null;
+    }
+
+    tracer.log('RESPONSE', {
+      factor: factor.factorName,
+      rating: loop.result.rating,
+      justification: loop.result.justification
+    });
 
     const score = this.resolveInherentRating(factor, loop.result.rating);
     if (score === undefined) return null;
@@ -953,14 +1155,14 @@ export class InherentAssessmentAgent {
   // Same pattern as ControlEffectivenessAgent.critiqueDrafts: one combined call
   // reviewing every draft rating against its own rubric/issue context again, framed
   // as checking a first pass's work rather than answering fresh.
-  private async critiqueFactorDrafts(drafts: Array<{ factor: any; rating: string; score: number; justification: string; issueRelevant: boolean; relevantIssues: string[]; issueNote: string }>): Promise<void> {
+  private async critiqueFactorDrafts(drafts: Array<{ factor: any; rating: string; score: number; justification: string; issueRelevant: boolean; relevantIssues: string[]; issueNote: string }>, tracer: AgentTracer): Promise<void> {
     const blocks = drafts.map((d, idx) => {
       const choiceStr = d.factor.choiceList.join(', ');
       return `[${idx + 1}] FACTOR: ${d.factor.factorName}\n    Guidance: ${d.factor.guidance || '(none provided)'}\n    Valid ratings: ${choiceStr}\n    DRAFT RATING: ${d.rating}\n    DRAFT ISSUE RELEVANCE: ${d.issueRelevant ? 'relevant — ' + d.relevantIssues.join('; ') : 'not relevant'}${d.issueNote ? ' (' + d.issueNote + ')' : ''}\n    DRAFT JUSTIFICATION: ${d.justification}`;
     }).join('\n\n');
 
     const prompt = [
-      'You are WissdaSense, now reviewing your own draft inherent-risk-factor ratings as a second, independent pass.',
+      'You are Ema, now reviewing your own draft inherent-risk-factor ratings as a second, independent pass.',
       'For each factor below, a first pass already produced a draft rating from the rubric and issue context shown.',
       'Check whether the draft rating actually follows from that rubric — not whether you would phrase it differently.',
       '',
@@ -996,12 +1198,22 @@ export class InherentAssessmentAgent {
       required: ['reviews']
     };
 
+    tracer.log('REQUEST', {
+      phase: 'critique',
+      prompt_preview: prompt
+    });
+
     try {
       const response = await this.llm.generateStructuredOutput<{ reviews: Array<{ index: number; action: string; rating: string; note?: string }> }>(
         prompt,
-        'You are WissdaSense, acting as an independent second reviewer of draft GRC ratings.',
+        'You are Ema, acting as an independent second reviewer of draft GRC ratings.',
         schema
       );
+      tracer.log('RESPONSE', {
+        phase: 'critique',
+        status: 'completed',
+        reviews: response.reviews
+      });
       for (const review of response.reviews || []) {
         const draft = drafts[review.index - 1];
         if (!draft || review.action !== 'revise') continue;
@@ -1011,9 +1223,10 @@ export class InherentAssessmentAgent {
         draft.score = score;
         draft.justification = `${draft.justification}\n\n🔁 Revised on second-pass review: ${review.note || 'rating did not hold up against the rubric on review.'}`;
       }
-    } catch (e) {
+    } catch (e: any) {
       // Critique is an enrichment pass — a failed or unparseable review leaves every
       // draft exactly as the first pass produced it, rather than blocking the run.
+      tracer.log('ERROR', { phase: 'critique', error: e.message });
     }
   }
 
@@ -1049,7 +1262,7 @@ export class InherentAssessmentAgent {
     const lines = rated.map(r => `- ${r.factor} [${r.rating}]: ${r.justification}`).join('\n');
 
     const prompt = [
-      'You are WissdaSense, writing an executive summary for a compliance manager reviewing inherent risk factor',
+      'You are Ema, writing an executive summary for a compliance manager reviewing inherent risk factor',
       'ratings for one risk. Below are the individual factor ratings and their supporting rationale — internal',
       'reference only, not to be repeated verbatim.',
       '',
@@ -1074,7 +1287,7 @@ export class InherentAssessmentAgent {
 
     let summary = '';
     try {
-      const parsed = await this.llm.generateStructuredOutput<{ summary: string }>(prompt, 'You are WissdaSense, a GRC compliance-narrative writer.', schema);
+      const parsed = await this.llm.generateStructuredOutput<{ summary: string }>(prompt, 'You are Ema, a GRC compliance-narrative writer.', schema);
       summary = parsed.summary || '';
     } catch (e) {
       // Synthesis is a best-effort enrichment — never block the rest of the run on it.
@@ -1089,36 +1302,133 @@ export class InherentAssessmentAgent {
 // ============================================================================
 // 3. Risk-Control Mapping Agent
 // ============================================================================
+type ResolvedControl = { sysId: string; name: string; category: string; reason: string };
+
 export class RiskControlMappingAgent {
-  constructor(private adapter: BaseGRCAdapter, private llm: BaseLLMClient) {}
+  // A single Gemini call can hold this many controls in one prompt before
+  // accuracy degrades from list-overload; beyond it, the run splits into
+  // match-only batches plus one consolidation call, rather than truncating
+  // the candidate pool. Constants below mirror a verified ServiceNow
+  // reference implementation of this same agent concept.
+  private static readonly BATCH_SIZE = 40;
+  private static readonly DESC_LIMIT = 250;
+  private static readonly RISK_DESC_LIMIT = 600;
+
+  constructor(private adapter: BaseGRCAdapter, private llm: BaseLLMClient) { }
 
   async execute(riskSysId: string): Promise<{ success: boolean; message: string; details: any }> {
+    const tracer = new AgentTracer();
+    tracer.log('START', { riskSysId });
+
     const risk = await this.adapter.getRisk(riskSysId);
-    if (!risk) return { success: false, message: 'Risk not found', details: null };
+    if (!risk) {
+      tracer.log('ERROR', { error: 'Risk not found' });
+      return { success: false, message: 'Risk not found', details: null };
+    }
+
+    tracer.log('INFO', { riskName: risk.name, profileName: risk.profileName });
 
     const entityLabel = this.adapter.getEntityLabel();
     const controls = await this.adapter.getControlsForEntity(risk.profileSysId || '');
-    if (controls.length === 0) {
-      return { success: false, message: `No controls available for ${entityLabel.toLowerCase()}`, details: null };
+    tracer.log('INFO', { controlCount: controls.length });
+
+    const result = controls.length === 0
+      ? await this.suggestNewControls(risk, entityLabel, tracer)
+      : controls.length <= RiskControlMappingAgent.BATCH_SIZE
+        ? await this.runSingleShot(risk, riskSysId, controls, entityLabel, tracer)
+        : await this.runChunked(risk, riskSysId, controls, entityLabel, tracer);
+
+    // Optional instance-level narrative (ServiceNow's advanced risk module
+    // carries a single u_ai_recommendation-style field directly on the risk
+    // record). Most platforms have no equivalent, so this is duck-typed —
+    // same convention as the Control Effectiveness / Inherent Assessment
+    // justification writes — and only fires when both the adapter supports
+    // it AND execute() actually produced a narrative to write.
+    const rawWriteSummary = (this.adapter as any).writeRiskMappingSummary;
+    if (typeof rawWriteSummary === 'function' && result.details?.narrative) {
+      await rawWriteSummary.call(this.adapter, riskSysId, result.details.narrative);
     }
 
-    const prompt = [
-      `RISK:`,
+    // ── Observability: write a trace record to u_ema_audit_trail if adapter supports it ──
+    const outcome = result.success ? 'mapped' : 'failed';
+    tracer.log('END', { outcome });
+
+    const writeTraceM = (this.adapter as any).writeObservabilityTrace;
+    if (typeof writeTraceM === 'function') {
+      try {
+        await writeTraceM.call(this.adapter, {
+          agentName: 'RiskControlMappingAgent',
+          targetId: riskSysId,
+          outcome,
+          results: result.details,
+          html: tracer.renderHtml('RiskControlMappingAgent', risk.name || riskSysId)
+        });
+      } catch (_) { /* observability is best-effort — never block the run */ }
+    }
+
+    return result;
+  }
+
+  private riskBlock(risk: Risk, entityLabel: string): string {
+    return [
+      'RISK:',
       `Name: ${risk.name}`,
-      `Description: ${risk.description}`,
-      `${entityLabel}: ${risk.profileName}`,
+      `Description: ${(risk.description || 'No description provided.').substring(0, RiskControlMappingAgent.RISK_DESC_LIMIT)}`,
+      `${entityLabel}: ${risk.profileName}`
+    ].join('\n');
+  }
+
+  private controlListBlock(controls: Control[]): string {
+    const limit = RiskControlMappingAgent.DESC_LIMIT;
+    return controls.map((c, idx) =>
+      `[${idx + 1}] Name: ${c.name} | Category: ${c.category || 'General'} | Desc: ${(c.description || 'No description').substring(0, limit)}`
+    ).join('\n');
+  }
+
+  /** Resolves LLM-returned {index, reason} pairs against a control pool (1-based index into that pool). */
+  private resolveAgainst(raw: Array<{ index: number; reason: string }> | undefined, pool: Control[]): ResolvedControl[] {
+    return (raw || [])
+      .map(r => {
+        const ctrl = pool[r.index - 1];
+        return ctrl ? { sysId: ctrl.sysId, name: ctrl.name, category: ctrl.category || 'General', reason: r.reason } : null;
+      })
+      .filter((m): m is ResolvedControl => m !== null);
+  }
+
+  /** Controls the model never mentioned (neither matched nor explicitly rejected) get a generic rejection note. */
+  private unmentionedRejections(pool: Control[], matches: Array<{ index: number }>, rejected: Array<{ index: number }>): ResolvedControl[] {
+    const mentioned = new Set([...matches.map(m => m.index), ...rejected.map(r => r.index)]);
+    return pool
+      .map((ctrl, idx) => ({ ctrl, idx: idx + 1 }))
+      .filter(({ idx }) => !mentioned.has(idx))
+      .map(({ ctrl }) => ({ sysId: ctrl.sysId, name: ctrl.name, category: ctrl.category || 'General', reason: 'Not evaluated as relevant to the specific risk profile and description provided.' }));
+  }
+
+  private dedupeBySysId(matches: ResolvedControl[]): ResolvedControl[] {
+    const seen = new Set<string>();
+    return matches.filter(m => (seen.has(m.sysId) ? false : (seen.add(m.sysId), true)));
+  }
+
+  // ── Single-shot path (control pool fits in one prompt) ───────────────────
+  private async runSingleShot(risk: Risk, riskSysId: string, controls: Control[], entityLabel: string, tracer: AgentTracer) {
+    const prompt = [
+      this.riskBlock(risk, entityLabel),
       '',
       `CANDIDATE CONTROLS (${controls.length} total from this ${entityLabel}):`,
-      controls.map((c, idx) => `[${idx + 1}] Name: ${c.name} | Category: ${c.category || 'General'} | Desc: ${c.description}`).join('\n'),
+      this.controlListBlock(controls),
       '',
       'TASK:',
-      '1. Select ALL controls that meaningfully mitigate this specific risk.',
-      '2. For EVERY control NOT selected, provide a concise rejection reason explaining why it does NOT meet the business criteria for this risk.',
-      '3. Provide overall justification, gaps, and specific recommendations.'
+      '1. Select controls that GENUINELY mitigate this specific risk — be selective, do not force',
+      '   a match just because a control sounds broadly compliance-related. An empty matches list',
+      '   is a valid answer.',
+      '2. For EVERY control NOT selected, provide a concise rejection reason explaining why it does',
+      '   NOT meet the business criteria for this risk.',
+      '3. Provide overall justification, gaps (what this risk is NOT covered for), and — only if',
+      '   gaps exist — specific recommendations for new controls to create.'
     ].join('\n');
 
     const systemInstruction = 'You are a GRC Compliance mapping architect. Analyze risks and select mapping control indexes. For every rejected control, explain why it does not address the business criteria of this specific risk.';
-    
+
     const schema = {
       type: 'OBJECT',
       properties: {
@@ -1149,58 +1459,260 @@ export class RiskControlMappingAgent {
         },
         overall_justification: { type: 'STRING' },
         gaps: { type: 'STRING' },
-        recommendation: { type: 'STRING' }
+        recommendation: { type: 'STRING', description: 'Only meaningful if gaps exist; empty string otherwise' }
       },
       required: ['match', 'matches', 'rejected', 'overall_justification', 'gaps']
     };
 
+    tracer.log('REQUEST', { path: 'singleShot', prompt_preview: prompt });
+
     const response = await this.llm.generateStructuredOutput<MappingResult>(prompt, systemInstruction, schema);
-    
-    const resolvedMatches = response.matches
-      .map(m => {
-        const ctrl = controls[m.index - 1];
-        return ctrl ? { sysId: ctrl.sysId, name: ctrl.name, category: ctrl.category || 'General', reason: m.reason } : null;
-      })
-      .filter((m): m is { sysId: string; name: string; category: string; reason: string } => m !== null);
 
-    // Build the full rejected list: use LLM-provided rejections + any controls not mentioned at all
-    const mentionedIndexes = new Set([
-      ...response.matches.map(m => m.index),
-      ...(response.rejected || []).map(r => r.index)
-    ]);
-    const llmRejected = (response.rejected || []).map(r => {
-      const ctrl = controls[r.index - 1];
-      return ctrl ? { sysId: ctrl.sysId, name: ctrl.name, category: ctrl.category || 'General', reason: r.reason } : null;
-    }).filter(Boolean) as { sysId: string; name: string; category: string; reason: string }[];
+    tracer.log('RESPONSE', { path: 'singleShot', matchesCount: response.matches?.length || 0, rejectedCount: response.rejected?.length || 0 });
 
-    // Any controls not mentioned by LLM get a generic rejection note
-    const unmentioned = controls
-      .map((ctrl, idx) => ({ ctrl, idx: idx + 1 }))
-      .filter(({ idx }) => !mentionedIndexes.has(idx))
-      .map(({ ctrl }) => ({ sysId: ctrl.sysId, name: ctrl.name, category: ctrl.category || 'General', reason: 'Not evaluated as relevant to the specific risk profile and description provided.' }));
+    const resolvedMatches = this.dedupeBySysId(this.resolveAgainst(response.matches, controls));
+    const resolvedRejected = [
+      ...this.resolveAgainst(response.rejected, controls),
+      ...this.unmentionedRejections(controls, response.matches, response.rejected || [])
+    ];
 
-    const resolvedRejected = [...llmRejected, ...unmentioned];
+    if (!response.match || resolvedMatches.length === 0) {
+      return this.finishNoMatch(risk, entityLabel, controls.length, resolvedRejected, response.overall_justification, response.gaps, response.recommendation || '');
+    }
 
-    await this.adapter.writeRiskControlMapping(
-      riskSysId,
-      resolvedMatches,
-      response.overall_justification,
-      response.gaps,
-      response.recommendation || ''
+    return this.finishMatched(risk, riskSysId, entityLabel, controls.length, resolvedMatches, resolvedRejected, response.overall_justification, response.gaps, response.recommendation || '');
+  }
+
+  // ── Chunked path (control pool too large for one prompt) ─────────────────
+  private async runChunked(risk: Risk, riskSysId: string, controls: Control[], entityLabel: string, tracer: AgentTracer) {
+    const batchSize = RiskControlMappingAgent.BATCH_SIZE;
+    const chunksTotal = Math.ceil(controls.length / batchSize);
+    let chunksOk = 0;
+    let allMatches: ResolvedControl[] = [];
+    let allRejected: ResolvedControl[] = [];
+
+    for (let i = 0; i < controls.length; i += batchSize) {
+      const chunkIndex = Math.floor(i / batchSize) + 1;
+      const chunk = controls.slice(i, i + batchSize);
+
+      const prompt = [
+        this.riskBlock(risk, entityLabel),
+        '',
+        `CANDIDATE CONTROLS — batch ${chunkIndex} of ${chunksTotal} (reference ONLY by the index number below):`,
+        this.controlListBlock(chunk),
+        '',
+        'TASK: From THIS BATCH ONLY, select controls that genuinely mitigate this risk (be selective,',
+        'an empty list is valid) and give every non-selected control a rejection reason. Do NOT provide',
+        'gap analysis or an overall justification — other batches exist that you cannot see here.'
+      ].join('\n');
+
+      const systemInstruction = 'You are a GRC Compliance mapping architect reviewing one batch of a larger control library against a single risk.';
+      const schema = {
+        type: 'OBJECT',
+        properties: {
+          matches: {
+            type: 'ARRAY',
+            items: { type: 'OBJECT', properties: { index: { type: 'INTEGER' }, reason: { type: 'STRING' } }, required: ['index', 'reason'] }
+          },
+          rejected: {
+            type: 'ARRAY',
+            items: { type: 'OBJECT', properties: { index: { type: 'INTEGER' }, reason: { type: 'STRING' } }, required: ['index', 'reason'] }
+          }
+        },
+        required: ['matches', 'rejected']
+      };
+
+      try {
+        tracer.log('REQUEST', { path: 'chunked_batch', batchIndex: chunkIndex, prompt_preview: prompt });
+        const response = await this.llm.generateStructuredOutput<{ matches: Array<{ index: number; reason: string }>; rejected: Array<{ index: number; reason: string }> }>(prompt, systemInstruction, schema);
+        tracer.log('RESPONSE', { path: 'chunked_batch', batchIndex: chunkIndex, matchesCount: response.matches?.length || 0, rejectedCount: response.rejected?.length || 0 });
+        chunksOk++;
+        allMatches.push(...this.resolveAgainst(response.matches, chunk));
+        allRejected.push(...this.resolveAgainst(response.rejected, chunk), ...this.unmentionedRejections(chunk, response.matches, response.rejected || []));
+      } catch (e: any) {
+        // One failed batch shouldn't sink the whole run — proceed with whatever other batches produced.
+        tracer.log('ERROR', { path: 'chunked_batch', batchIndex: chunkIndex, error: e.message });
+      }
+    }
+
+    if (chunksOk === 0) {
+      return { success: false, message: 'AI evaluation failed for all control batches — please retry.', details: null };
+    }
+
+    allMatches = this.dedupeBySysId(allMatches);
+    const coverageNote = chunksOk < chunksTotal
+      ? `Note: only ${chunksOk} of ${chunksTotal} control batches were evaluated — re-run to complete coverage.`
+      : '';
+
+    // Consolidation call: one combined justification/gaps/recommendation over
+    // the matches gathered across all batches, since no single batch prompt
+    // saw the full picture.
+    let justification = '', gaps = '', recommendation = '';
+    try {
+      const matchedList = allMatches.length === 0
+        ? '(none — no existing control matched)'
+        : allMatches.map(m => `- ${m.name} (${m.reason})`).join('\n');
+      const consPrompt = [
+        this.riskBlock(risk, entityLabel),
+        '',
+        'MATCHED CONTROLS (selected across all batches):',
+        matchedList,
+        '',
+        'TASK:',
+        '1. overall_justification: 2-3 sentences on the common theme across matched controls',
+        '   (or why the library does not cover this risk if none matched).',
+        '2. gaps: 2-4 sentences on aspects of the risk NOT covered by matched controls. If fully',
+        '   covered say so explicitly.',
+        '3. recommendation: only if gaps exist — controls to create, plain text. Empty string otherwise.'
+      ].join('\n');
+      const consSchema = {
+        type: 'OBJECT',
+        properties: { overall_justification: { type: 'STRING' }, gaps: { type: 'STRING' }, recommendation: { type: 'STRING' } },
+        required: ['overall_justification', 'gaps']
+      };
+
+      tracer.log('REQUEST', { path: 'consolidation', prompt_preview: consPrompt });
+      const cons = await this.llm.generateStructuredOutput<{ overall_justification: string; gaps: string; recommendation?: string }>(consPrompt, 'You are a GRC Compliance mapping architect writing a consolidated summary.', consSchema);
+      tracer.log('RESPONSE', { path: 'consolidation', status: 'completed' });
+      justification = cons.overall_justification || '';
+      gaps = cons.gaps || '';
+      recommendation = cons.recommendation || '';
+    } catch (e: any) {
+      // Best-effort — matches themselves are already resolved regardless.
+      tracer.log('ERROR', { path: 'consolidation', error: e.message });
+    }
+
+    if (allMatches.length === 0) {
+      return this.finishNoMatch(risk, entityLabel, controls.length, allRejected, justification, gaps, recommendation, coverageNote);
+    }
+
+    return this.finishMatched(risk, riskSysId, entityLabel, controls.length, allMatches, allRejected, justification, gaps, recommendation, coverageNote);
+  }
+
+  // ── No controls exist for this entity at all ──────────────────────────────
+  private async suggestNewControls(risk: Risk, entityLabel: string, tracer: AgentTracer) {
+    const prompt = [
+      `You are a GRC expert. No controls exist for this ${entityLabel.toLowerCase()} yet.`,
+      '',
+      this.riskBlock(risk, entityLabel),
+      '',
+      'TASK: Suggest 2-4 controls to create to mitigate this risk. Each needs a concise name and a',
+      '1-2 sentence description. Also provide a 2-3 sentence explanation of why these controls',
+      'together address the risk.'
+    ].join('\n');
+
+    const schema = {
+      type: 'OBJECT',
+      properties: {
+        suggested_controls: {
+          type: 'ARRAY',
+          items: { type: 'OBJECT', properties: { name: { type: 'STRING' }, description: { type: 'STRING' } }, required: ['name', 'description'] }
+        },
+        explanation: { type: 'STRING' }
+      },
+      required: ['suggested_controls', 'explanation']
+    };
+
+    tracer.log('REQUEST', { path: 'suggestNewControls', prompt_preview: prompt });
+
+    const response = await this.llm.generateStructuredOutput<{ suggested_controls: Array<{ name: string; description: string }>; explanation: string }>(
+      prompt, 'You are a GRC expert recommending new controls where a library gap exists.', schema
     );
+
+    const suggestions = response.suggested_controls || [];
+
+    tracer.log('RESPONSE', { path: 'suggestNewControls', suggestionsCount: suggestions.length });
+
+    const narrative = [
+      `No controls exist for ${entityLabel.toLowerCase()} "${risk.profileName}".`,
+      '',
+      'Suggested controls to create:',
+      ...suggestions.map(c => `- ${c.name}: ${c.description}`),
+      '',
+      'Why these controls:',
+      response.explanation || 'Not provided'
+    ].join('\n');
 
     return {
       success: true,
-      message: `Mapped ${resolvedMatches.length} control(s) to risk. Rejected ${resolvedRejected.length} control(s).`,
+      message: `No controls available for ${entityLabel.toLowerCase()} — suggested ${suggestions.length} new control(s)`,
       details: {
         entityLabel,
         entityName: risk.profileName,
-        totalControlsEvaluated: controls.length,
-        matches: resolvedMatches,
-        rejected: resolvedRejected,
-        justification: response.overall_justification,
-        gaps: response.gaps,
-        recommendations: response.recommendation
+        totalControlsEvaluated: 0,
+        matches: [],
+        rejected: [],
+        suggestedControls: suggestions,
+        explanation: response.explanation,
+        narrative
+      }
+    };
+  }
+
+  private async finishMatched(
+    risk: Risk, riskSysId: string, entityLabel: string, totalControls: number,
+    matches: ResolvedControl[], rejected: ResolvedControl[],
+    justification: string, gaps: string, recommendation: string, coverageNote: string = ''
+  ) {
+    await this.adapter.writeRiskControlMapping(riskSysId, matches, justification, gaps, recommendation);
+
+    const narrative = [
+      `Mapped ${matches.length} control(s) to this risk.`,
+      '',
+      'Why these controls:',
+      justification || 'Not provided',
+      '',
+      'Gaps — areas not covered by existing controls:',
+      gaps || 'None identified',
+      ...(coverageNote ? ['', coverageNote] : [])
+    ].join('\n');
+
+    return {
+      success: true,
+      message: `Mapped ${matches.length} control(s) to risk. Rejected ${rejected.length} control(s).`,
+      details: {
+        entityLabel,
+        entityName: risk.profileName,
+        totalControlsEvaluated: totalControls,
+        matches,
+        rejected,
+        justification,
+        gaps,
+        recommendations: recommendation,
+        narrative
+      }
+    };
+  }
+
+  private finishNoMatch(
+    risk: Risk, entityLabel: string, totalControls: number, rejected: ResolvedControl[],
+    justification: string, gaps: string, recommendation: string, coverageNote: string = ''
+  ) {
+    const narrative = [
+      `Reviewed ${totalControls} control(s) and found none that genuinely mitigate this risk.`,
+      '',
+      'Why:',
+      justification || 'Not provided',
+      '',
+      'Gaps:',
+      gaps || 'Not provided',
+      ...(recommendation ? ['', 'Recommended controls to create:', recommendation] : []),
+      ...(coverageNote ? ['', coverageNote] : [])
+    ].join('\n');
+
+    return {
+      success: true,
+      message: 'No genuine match found — recommendation written',
+      details: {
+        entityLabel,
+        entityName: risk.profileName,
+        totalControlsEvaluated: totalControls,
+        matches: [],
+        rejected,
+        justification,
+        gaps,
+        recommendations: recommendation,
+        narrative
       }
     };
   }

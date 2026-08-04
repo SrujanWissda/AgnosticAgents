@@ -49,7 +49,8 @@ export type TestEvidence = z.infer<typeof TestEvidenceSchema>;
 // Agnostic Assessment Instance Model
 export const AssessmentInstanceSchema = z.object({
   sysId: z.string(),
-  riskSysId: z.string()
+  riskSysId: z.string(),
+  number: z.string().optional()
 });
 export type AssessmentInstance = z.infer<typeof AssessmentInstanceSchema>;
 

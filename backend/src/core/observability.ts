@@ -37,8 +37,14 @@ export interface Trace {
   spans: Span[];
 }
 
-const DATA_DIR = path.join(__dirname, '..', '..', 'data');
-const TRACES_PATH = path.join(DATA_DIR, 'traces.jsonl');
+// On Vercel (and other serverless runtimes) the filesystem is read-only
+// except for /tmp. Use /tmp for ephemeral persistence so the observability
+// system still works; on a local Express server use the normal data/ dir.
+const IS_SERVERLESS = !!(process.env.VERCEL || process.env.AWS_LAMBDA_FUNCTION_NAME);
+const DATA_DIR = IS_SERVERLESS ? '/tmp' : path.join(__dirname, '..', '..', 'data');
+const TRACES_PATH = IS_SERVERLESS
+  ? '/tmp/grc-traces.jsonl'
+  : path.join(DATA_DIR, 'traces.jsonl');
 const RING_SIZE = 200;
 
 const storage = new AsyncLocalStorage<Trace>();

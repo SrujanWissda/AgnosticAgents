@@ -35,7 +35,6 @@ const llmClient = new GeminiLLMClient();
 const embeddingsClient = new GeminiEmbeddingsClient();
 const vectorStore = new VectorStore();
 const universalDiscoveryAgent = new UniversalSchemaDiscoveryAgent(llmClient, embeddingsClient, vectorStore);
-const servicenowAdapter = new ServiceNowAdapter();
 const salesforceAdapter = new SalesforceAdapter();
 
 // Registry of dynamically onboarded platforms (built by UniversalSchemaDiscoveryAgent).
@@ -92,15 +91,9 @@ app.post('/api/run-agent', async (req, res) => {
   }
 
   // 1. Select Adapter
-  let adapter;
-  if (platform === 'servicenow') {
-    adapter = servicenowAdapter;
-  } else if (platform === 'salesforce') {
-    adapter = salesforceAdapter;
-  } else if (dynamicAdapters.has(platform)) {
-    adapter = dynamicAdapters.get(platform)!;
-  } else {
-    return res.status(400).json({ error: `Unsupported platform adapter: ${platform}` });
+  const adapter = platform === 'servicenow' ? new ServiceNowAdapter() : (platform === 'salesforce' ? salesforceAdapter : dynamicAdapters.get(platform));
+  if (!adapter) {
+    return res.status(400).json({ error: `Platform '${platform}' is not supported.` });
   }
 
   // Capture standard log outputs
@@ -165,7 +158,7 @@ app.get('/api/observability/stats', (req, res) => {
 // Endpoint to list all available risks from ServiceNow (live or mock)
 app.get('/api/platforms/servicenow/risks', async (req, res) => {
   try {
-    const risks = await servicenowAdapter.getAllRisks();
+    const risks = await new ServiceNowAdapter().getAllRisks();
     res.json({ success: true, risks });
   } catch (error: any) {
     res.status(500).json({ success: false, error: error.message });
@@ -175,9 +168,15 @@ app.get('/api/platforms/servicenow/risks', async (req, res) => {
 // Endpoint to list all assessment instances from ServiceNow (live or mock)
 app.get('/api/platforms/servicenow/assessments', async (req, res) => {
   try {
-    const agent = req.query.agent as string;
-    const instances = await servicenowAdapter.getAllAssessmentInstances(agent);
-    res.json({ success: true, instances });
+    const adapter = new ServiceNowAdapter();
+    const agentFilter = req.query.agent ? String(req.query.agent) : undefined;
+    const instances = await adapter.getAllAssessmentInstances(agentFilter);
+    res.json({
+      success: true,
+      useLive: (adapter as any).useLive,
+      instanceUrl: (adapter as any).instanceUrl ? 'configured' : 'missing',
+      instances
+    });
   } catch (error: any) {
     res.status(500).json({ success: false, error: error.message });
   }
@@ -324,7 +323,15 @@ app.get('/api/platforms/:platformName/assessments', async (req, res) => {
   }
 });
 
-// Server bootup
-app.listen(PORT, () => {
-  console.log(`[GRC Agnostic Server] Listening on http://localhost:${PORT}`);
-});
+
+// Export for Vercel (and other serverless runtimes) which import the app
+// directly without calling listen(). Local Express dev still calls listen().
+export default app;
+
+// Server bootup — skipped on Vercel where the platform invokes the handler directly
+if (!process.env.VERCEL) {
+  app.listen(PORT, () => {
+    console.log(`[GRC Agnostic Server] Listening on http://localhost:${PORT}`);
+  });
+}
+
