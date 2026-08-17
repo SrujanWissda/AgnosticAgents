@@ -863,6 +863,7 @@ export class SalesforceAdapter extends BaseGRCAdapter {
 
   // --------------------------------------------------------------------------
   // createEMATrail — creates an audit trail record for agent execution
+  // Falls back to appending to assessment record if EMA object doesn't exist
   // --------------------------------------------------------------------------
   private async createEMATrail(
     recordSysId: string,
@@ -872,7 +873,7 @@ export class SalesforceAdapter extends BaseGRCAdapter {
   ): Promise<void> {
     try {
       const token = await this.getAccessToken();
-      // Create a new EMA audit trail record linked to the assessment record
+      // Try to create a dedicated EMA audit trail record first
       const payload = {
         Risk__Assessment_Record_Id__c: recordSysId,
         Risk__Assessment_Type__c: assessmentType,
@@ -881,23 +882,47 @@ export class SalesforceAdapter extends BaseGRCAdapter {
         Risk__Created_Date__c: new Date().toISOString()
       };
 
-      const response = await axios.post(
-        `${this.instanceUrl}/services/data/v60.0/sobjects/Risk__EMA_Audit_Trail__c`,
-        payload,
-        {
-          headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
-          timeout: 15000
-        }
-      );
+      try {
+        const response = await axios.post(
+          `${this.instanceUrl}/services/data/v60.0/sobjects/Risk__EMA_Audit_Trail__c`,
+          payload,
+          {
+            headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+            timeout: 15000
+          }
+        );
 
-      console.log(`[SalesforceAdapter] Created EMA audit trail record ${response.data.id} for ${recordType} ${recordSysId}`);
-    } catch (e: any) {
-      // If the EMA audit trail object doesn't exist, just log a warning instead of failing
-      if (e.response?.status === 404 || e.message?.includes('sobject type')) {
-        console.warn(`[SalesforceAdapter] EMA audit trail object not found in Salesforce. Object may not be configured. Skipping trail creation.`);
-      } else {
-        throw e;
+        console.log(`[SalesforceAdapter] ✅ Created EMA audit trail record ${response.data.id} for ${recordType} ${recordSysId}`);
+        return;
+      } catch (trailErr: any) {
+        // If EMA object doesn't exist, fall back to storing in assessment record
+        if (trailErr.response?.status === 404 || trailErr.message?.includes('sobject type')) {
+          console.warn(`[SalesforceAdapter] ⚠️  EMA_Audit_Trail__c object not found. Using fallback: storing audit trail in assessment record.`);
+
+          // Fallback: append audit trail to the assessment record's audit/notes field
+          // For Control Assessment: append to Risk__Audit_Trail_Notes__c
+          // For Rating Assessment: append to Risk__Audit_Trail_Notes__c
+          if (recordType === 'Risk__Control_Assessment__c') {
+            await this.restUpdate(recordType, recordSysId, {
+              Risk__Audit_Trail_Notes__c: auditTrailHtml
+            });
+            console.log(`[SalesforceAdapter] ✅ Appended audit trail to ${recordType} ${recordSysId} (fallback)`);
+          } else if (recordType === 'Risk__Risk_Assessment_Rating__c') {
+            // For rating records, we may need to append or truncate to fit
+            await this.restUpdate(recordType, recordSysId, {
+              Risk__Audit_Trail_Notes__c: auditTrailHtml.substring(0, 32768)
+            });
+            console.log(`[SalesforceAdapter] ✅ Appended audit trail to ${recordType} ${recordSysId} (fallback)`);
+          }
+          return;
+        }
+
+        // For other errors, re-throw
+        throw trailErr;
       }
+    } catch (e: any) {
+      console.error(`[SalesforceAdapter] ❌ EMA audit trail failed: ${e.message}`);
+      // Don't throw — audit trail is non-critical, assessment should still complete
     }
   }
 
