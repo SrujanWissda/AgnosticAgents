@@ -199,13 +199,20 @@ export class ServiceNowAdapter extends BaseGRCAdapter {
     }
   }
 
-  /** Instrumented PUT to a ServiceNow table record. */
-  private async putRecord(tableName: string, sysId: string, payload: Record<string, any>): Promise<void> {
+  /**
+   * Instrumented PUT to a ServiceNow table record. Returns the persisted record
+   * as ServiceNow echoes it back — callers use this to VERIFY a write actually
+   * landed, since ServiceNow has been observed returning 200 while silently
+   * dropping specific field values on certain tables (confirmed live: the
+   * risk-control m2m links and instance justification fields both did this at
+   * different points). A successful HTTP response is not proof of a real write.
+   */
+  private async putRecord(tableName: string, sysId: string, payload: Record<string, any>): Promise<Record<string, any>> {
     let url = this.instanceUrl.endsWith('/') ? this.instanceUrl : `${this.instanceUrl}/`;
     url += `api/now/table/${tableName}/${sysId}`;
     const t0 = Date.now();
     try {
-      await axios.put(url, payload, {
+      const response = await axios.put(url, payload, {
         headers: {
           'Authorization': this.authHeader,
           'Accept': 'application/json',
@@ -213,19 +220,20 @@ export class ServiceNowAdapter extends BaseGRCAdapter {
         }
       });
       recordSpan('platform.update', t0, 'ok', { platform: 'servicenow', object: tableName, recordId: sysId });
+      return response.data?.result || {};
     } catch (e: any) {
       recordSpan('platform.update', t0, 'error', { platform: 'servicenow', object: tableName, recordId: sysId, error: e.message });
       throw e;
     }
   }
 
-  /** Instrumented POST creating a ServiceNow table record. */
-  private async postRecord(tableName: string, payload: Record<string, any>): Promise<void> {
+  /** Instrumented POST creating a ServiceNow table record. Returns the created record (see putRecord doc — same verify-don't-trust-the-status-code reasoning). */
+  private async postRecord(tableName: string, payload: Record<string, any>): Promise<Record<string, any>> {
     let url = this.instanceUrl.endsWith('/') ? this.instanceUrl : `${this.instanceUrl}/`;
     url += `api/now/table/${tableName}`;
     const t0 = Date.now();
     try {
-      await axios.post(url, payload, {
+      const response = await axios.post(url, payload, {
         headers: {
           'Authorization': this.authHeader,
           'Accept': 'application/json',
@@ -233,11 +241,17 @@ export class ServiceNowAdapter extends BaseGRCAdapter {
         }
       });
       recordSpan('platform.create', t0, 'ok', { platform: 'servicenow', object: tableName });
+      return response.data?.result || {};
     } catch (e: any) {
       const detail = e.response?.data ? JSON.stringify(e.response.data) : e.message;
       recordSpan('platform.create', t0, 'error', { platform: 'servicenow', object: tableName, error: detail });
       throw new Error(`ServiceNow POST ${tableName} failed: ${detail}`);
     }
+  }
+
+  /** True only if every named field is non-empty on the record ServiceNow echoed back from a write. */
+  private isVerified(record: Record<string, any>, fields: string[]): boolean {
+    return fields.every(f => getValue(record[f]).length > 0);
   }
 
   async getAllAssessmentInstances(agent?: string): Promise<{ sysId: string; riskSysId: string; riskName: string; state: string }[]> {
@@ -754,7 +768,7 @@ export class ServiceNowAdapter extends BaseGRCAdapter {
     evidenceSummary: string,
     auditTrail: string,
     fingerprint: string
-  ): Promise<void> {
+  ): Promise<boolean> {
     if (this.useLive) {
       try {
         const payload: Record<string, any> = {
@@ -769,13 +783,14 @@ export class ServiceNowAdapter extends BaseGRCAdapter {
           payload.u_rationale_auditing_purpose = auditTrail;
         }
 
-        await this.putRecord('sn_risk_advanced_risk_assessment_instance_response', rowSysId, payload);
-        console.log(`[ServiceNow LIVE UPDATE] Successfully updated response row ${rowSysId} on PDI.`);
+        const persisted = await this.putRecord('sn_risk_advanced_risk_assessment_instance_response', rowSysId, payload);
+        const verified = this.isVerified(persisted, ['additional_comments']);
+        console.log(`[ServiceNow LIVE UPDATE] ${verified ? 'Successfully updated and verified' : 'Wrote but could NOT verify'} response row ${rowSysId} on PDI.`);
         console.log(`[ServiceNow LIVE UPDATE] additional_comments:\n${evidenceSummary}`);
         if (auditTrail) {
           console.log(`[ServiceNow LIVE UPDATE] u_rationale_auditing_purpose:\n${auditTrail}`);
         }
-        return;
+        return verified;
       } catch (e: any) {
         console.warn(`[ServiceNow LIVE UPDATE] Failed to write back to PDI, writing to local mock instead. Error: ${e.message}`);
       }
@@ -792,7 +807,9 @@ export class ServiceNowAdapter extends BaseGRCAdapter {
       if (auditTrail) {
         console.log(`  u_rationale_auditing_purpose:\n${auditTrail}`);
       }
+      return true;
     }
+    return false;
   }
 
   async writeInherentFactor(
@@ -802,7 +819,7 @@ export class ServiceNowAdapter extends BaseGRCAdapter {
     justification: string,
     comment: string,
     auditTrail: string
-  ): Promise<void> {
+  ): Promise<boolean> {
     if (this.useLive) {
       try {
         const payload: Record<string, any> = {
@@ -815,13 +832,14 @@ export class ServiceNowAdapter extends BaseGRCAdapter {
           payload.u_rationale_auditing_purpose = auditTrail;
         }
 
-        await this.putRecord('sn_risk_advanced_risk_assessment_instance_response', rowSysId, payload);
-        console.log(`[ServiceNow LIVE UPDATE] Successfully updated inherent factor response row ${rowSysId} on PDI.`);
+        const persisted = await this.putRecord('sn_risk_advanced_risk_assessment_instance_response', rowSysId, payload);
+        const verified = this.isVerified(persisted, ['additional_comments']);
+        console.log(`[ServiceNow LIVE UPDATE] ${verified ? 'Successfully updated and verified' : 'Wrote but could NOT verify'} inherent factor response row ${rowSysId} on PDI.`);
         console.log(`[ServiceNow LIVE UPDATE] additional_comments:\n${comment}`);
         if (auditTrail) {
           console.log(`[ServiceNow LIVE UPDATE] u_rationale_auditing_purpose:\n${auditTrail}`);
         }
-        return;
+        return verified;
       } catch (e: any) {
         console.warn(`[ServiceNow LIVE UPDATE] Failed to write back to PDI, writing to local mock instead. Error: ${e.message}`);
       }
@@ -837,7 +855,9 @@ export class ServiceNowAdapter extends BaseGRCAdapter {
       if (auditTrail) {
         console.log(`  u_rationale_auditing_purpose:\n${auditTrail}`);
       }
+      return true;
     }
+    return false;
   }
 
   async writeRiskControlMapping(
@@ -846,22 +866,28 @@ export class ServiceNowAdapter extends BaseGRCAdapter {
     justification: string,
     gaps: string,
     recommendations: string
-  ): Promise<void> {
+  ): Promise<boolean> {
     if (this.useLive) {
       try {
+        let allVerified = true;
         for (const ctrl of matchedControls) {
           // If the control object has active === false, skip sending it to avoid triggering the 'Avoid inactive items' Business Rule
           if ((ctrl as any).active === false) {
             console.log(`[ServiceNow LIVE UPDATE] Skipping inactive control ${ctrl.sysId} to comply with Business Rule.`);
             continue;
           }
-          await this.postRecord('sn_risk_m2m_risk_control', {
+          const persisted = await this.postRecord('sn_risk_m2m_risk_control', {
             sn_risk_risk: riskSysId,
             sn_compliance_control: ctrl.sysId
           });
+          const verified = this.isVerified(persisted, ['sn_risk_risk', 'sn_compliance_control']);
+          if (!verified) {
+            console.warn(`[ServiceNow LIVE UPDATE] Link for control ${ctrl.sysId} reported success but came back with empty reference fields.`);
+            allVerified = false;
+          }
         }
-        console.log(`[ServiceNow LIVE UPDATE] Created risk-control links in sn_risk_m2m_risk_control table.`);
-        return;
+        console.log(`[ServiceNow LIVE UPDATE] ${allVerified ? 'Created and verified' : 'Attempted'} risk-control links in sn_risk_m2m_risk_control table.`);
+        return allVerified;
       } catch (e: any) {
         console.warn(`[ServiceNow LIVE UPDATE] Failed to write risk control mappings to PDI, updating mock database instead. Error: ${e.message}`);
       }
@@ -880,6 +906,7 @@ export class ServiceNowAdapter extends BaseGRCAdapter {
 
     console.log(`[ServiceNow DB UPDATE] Created ${matchedControls.length} rows in [sn_risk_m2m_risk_control] linking risk [${riskSysId}]`);
     console.log(`[ServiceNow DB UPDATE] Table [sn_risk_risk] row [${riskSysId}] -> u_ai_recommendation: [HTML summary written]`);
+    return true;
   }
 
   // ── Optional instance-level justification concept (duck-typed) ──────────
@@ -933,36 +960,295 @@ export class ServiceNowAdapter extends BaseGRCAdapter {
     }
   }
 
-  async writeControlJustificationSummary(instanceSysId: string, text: string): Promise<void> {
-    if (!this.useLive) return;
+  // ── Optional memory-reuse for RiskControlMappingAgent (duck-typed) ──────
+  // sn_risk_m2m_risk_control already holds every existing risk→control link;
+  // reading it back lets the agent skip re-deciding controls that are already
+  // mapped, instead of burning an LLM call (and creating a duplicate link row)
+  // on every re-run. Returns null when unsupported/failed — distinct from an
+  // empty Set, which correctly means "supported, but nothing mapped yet".
+  async getExistingRiskControlMappings(riskSysId: string): Promise<Set<string> | null> {
+    if (!this.useLive) return null; // mock DB has no meaningful representation of this
     try {
-      await this.putRecord('sn_risk_advanced_risk_assessment_instance', instanceSysId, { control_justification: text });
-      console.log(`[ServiceNow LIVE UPDATE] Wrote control_justification on instance ${instanceSysId}.`);
+      const results = await this.queryTable<any>('sn_risk_m2m_risk_control', {
+        sysparm_query: `sn_risk_risk=${riskSysId}`,
+        sysparm_fields: 'sn_compliance_control'
+      });
+      return new Set(results.map(r => getValue(r.sn_compliance_control)).filter(Boolean));
     } catch (e: any) {
-      console.warn(`[ServiceNow LIVE UPDATE] Failed to write control_justification: ${e.message}`);
+      console.warn(`[ServiceNowAdapter] Failed to fetch existing risk-control mappings: ${e.message}`);
+      return null;
     }
   }
 
-  async writeResidualJustification(instanceSysId: string, text: string): Promise<void> {
-    if (!this.useLive) return;
+  // ── Optional Issue Identification Agent support (duck-typed) ────────────
+  // Trigger decision (when to call this) lives entirely on the ServiceNow
+  // side — a client script the caller writes themselves, e.g. on the risk's
+  // state field reaching Monitor — not in this backend. These two methods
+  // are what the agent needs once it's told which risk to act on: find the
+  // relevant assessment instance, and confirm no issue already exists for it
+  // (so an accidental double-call from the trigger script doesn't create a
+  // duplicate issue).
+  async resolveLatestAssessmentInstance(riskSysId: string): Promise<string | null> {
+    if (!this.useLive) return null;
     try {
-      await this.putRecord('sn_risk_advanced_risk_assessment_instance', instanceSysId, { residual_justification: text });
-      console.log(`[ServiceNow LIVE UPDATE] Wrote residual_justification on instance ${instanceSysId}.`);
+      // Most recent assessment instance for this risk — the one whose
+      // calculated residual rating and approver are relevant right now (a
+      // risk can have older, closed assessment cycles too).
+      const instances = await this.queryTable<any>('sn_risk_advanced_risk_assessment_instance', {
+        sysparm_query: `risk=${riskSysId}^ORDERBYDESCsys_created_on`,
+        sysparm_fields: 'sys_id'
+      });
+      return instances.length > 0 ? getValue(instances[0].sys_id) : null;
+    } catch (e: any) {
+      console.warn(`[ServiceNowAdapter] Failed to resolve latest assessment instance for risk ${riskSysId}: ${e.message}`);
+      return null;
+    }
+  }
+
+  // Returns null (not false) on query failure — distinct from a confirmed
+  // "no issue exists" — so the caller can fail closed (skip rather than risk
+  // a duplicate) instead of silently guessing either way.
+  async hasExistingIssueForAssessment(assessmentInstanceSysId: string): Promise<boolean | null> {
+    if (!this.useLive) return false;
+    try {
+      const existingLinks = await this.queryTable<any>('sn_risk_advanced_m2m_issue_risk_assessment', {
+        sysparm_query: `risk_assessment=${assessmentInstanceSysId}`,
+        sysparm_fields: 'sys_id'
+      });
+      return existingLinks.length > 0;
+    } catch (e: any) {
+      console.warn(`[ServiceNowAdapter] Failed to check for existing issue on assessment ${assessmentInstanceSysId}: ${e.message}`);
+      return null;
+    }
+  }
+
+  // Context needed to draft an issue from an assessment instance already in
+  // Monitor status: the platform-calculated residual rating (same
+  // summary_residual_risk_score field read by getInstanceJustificationContext)
+  // and the assessment's approver — confirmed as the correct "Issue Inputter"
+  // source field (approver_user, NOT assessor_user).
+  async getIssueDraftContext(assessmentInstanceSysId: string): Promise<{
+    residualRatingLabel: string;
+    approverUserSysId: string;
+    assessmentNumber: string;
+  } | null> {
+    if (!this.useLive) return null;
+    try {
+      const results = await this.queryTable<any>('sn_risk_advanced_risk_assessment_instance', {
+        sysparm_query: `sys_id=${assessmentInstanceSysId}`,
+        sysparm_fields: 'sys_id,number,summary_residual_risk_score,approver_user'
+      });
+      if (results.length === 0) return null;
+      const record = results[0];
+
+      // approver_user is a glide_list (multiple approvers possible) — take
+      // the first sys_id as the issue owner.
+      const approverRaw = getValue(record.approver_user);
+      const approverUserSysId = approverRaw.split(',')[0]?.trim() || '';
+
+      return {
+        residualRatingLabel: getDisplayValue(record.summary_residual_risk_score),
+        approverUserSysId,
+        assessmentNumber: getDisplayValue(record.number)
+      };
+    } catch (e: any) {
+      console.warn(`[ServiceNowAdapter] Failed to read issue draft context: ${e.message}`);
+      return null;
+    }
+  }
+
+  // The 5 configured issue-rating rows (label + remediation timeframe), used
+  // to fuzzy-match a residual rating label onto a real sn_grc_issue_rating
+  // reference. Note the label field on this table is itself named
+  // 'issue_rating' — confirmed via live dictionary lookup, not 'name'.
+  async getIssueRatingOptions(): Promise<Array<{ sysId: string; label: string }>> {
+    if (!this.useLive) return [];
+    try {
+      const results = await this.queryTable<any>('sn_grc_issue_rating', {
+        sysparm_fields: 'sys_id,issue_rating'
+      });
+      return results
+        .map(r => ({ sysId: getValue(r.sys_id), label: getDisplayValue(r.issue_rating) }))
+        .filter(r => r.sysId && r.label);
+    } catch (e: any) {
+      console.warn(`[ServiceNowAdapter] Failed to fetch issue rating options: ${e.message}`);
+      return [];
+    }
+  }
+
+  // Creates the sn_grc_issue record plus its link back to the originating
+  // assessment (sn_risk_advanced_m2m_issue_risk_assessment) — the confirmed
+  // junction table already in real production use for issue-to-risk-assessment
+  // linking. Each write is independently verified via isVerified, same
+  // convention as every other write method (an HTTP 200 is not proof).
+  async createRiskIssue(payload: {
+    riskSysId: string;
+    profileSysId: string;
+    assessmentInstanceSysId: string;
+    issueRatingSysId: string;
+    issueManagerSysId: string;
+    rationaleHtml: string;
+    shortDescription: string;
+    description: string;
+  }): Promise<{ verified: boolean; issueSysId: string }> {
+    if (!this.useLive) return { verified: true, issueSysId: 'mock_issue' };
+
+    try {
+      const issuePayload: Record<string, any> = {
+        classification: '2',                                 // Risk
+        // issue_type intentionally omitted — this PDI's choice list deactivated
+        // the old numeric values (including '1' "Risk issue") in favor of a
+        // string-based taxonomy (Self-Identified, Audit, Regulatory Affairs,
+        // etc.) with no single value that fits an AI-agent-created issue.
+        // Writing a stale/inactive choice value is silently dropped by
+        // ServiceNow, which was failing the write-verification check below.
+        issue_source: '4f6b97f6c75200107e299e0703c26031',     // "Risk Assessment" (confirmed sys_id)
+        // 'item' (label "Item", references the shared sn_grc_item base table
+        // that sn_risk_risk extends) is the actual risk link on an issue —
+        // confirmed live: sn_risk_risk records share their sys_id with their
+        // sn_grc_item row, so the risk's own sys_id is the correct value here,
+        // same identifier used for every other reference to this risk.
+        item: payload.riskSysId,
+        short_description: payload.shortDescription,
+        description: payload.description,
+        u_issue_summarize_ema: payload.rationaleHtml
+      };
+      if (payload.issueRatingSysId) issuePayload.issue_rating = payload.issueRatingSysId;
+      if (payload.issueManagerSysId) issuePayload.issue_manager = payload.issueManagerSysId;
+      if (payload.profileSysId) issuePayload.profile = payload.profileSysId;
+      // NOTE: sn_grc_issue.action_plan / u_action_plan_name are NOT the real
+      // action-plan mechanism, despite looking like a plausible single-field
+      // target — confirmed by the user. The real "Action Plans" concept is a
+      // related child record on sn_grc_task (see createActionPlanTask below),
+      // linked back to this issue via its own 'issue' reference field.
+
+      const persisted = await this.postRecord('sn_grc_issue', issuePayload);
+      const issueSysId = getValue(persisted.sys_id);
+
+      const requiredFields = ['classification', 'short_description', 'item'];
+      if (payload.issueRatingSysId) requiredFields.push('issue_rating');
+      if (payload.issueManagerSysId) requiredFields.push('issue_manager');
+      const verified = !!issueSysId && this.isVerified(persisted, requiredFields);
+
+      if (!issueSysId) {
+        console.warn(`[ServiceNow LIVE UPDATE] Issue creation for risk ${payload.riskSysId} returned no sys_id.`);
+        return { verified: false, issueSysId: '' };
+      }
+      if (!verified) {
+        console.warn(`[ServiceNow LIVE UPDATE] Issue ${issueSysId} created but one or more fields could not be verified.`);
+      }
+
+      const linkPersisted = await this.postRecord('sn_risk_advanced_m2m_issue_risk_assessment', {
+        risk_assessment: payload.assessmentInstanceSysId,
+        sn_grc_issue: issueSysId,
+        is_issue_new: true,
+        is_originator: true
+      });
+      const linkVerified = this.isVerified(linkPersisted, ['risk_assessment', 'sn_grc_issue']);
+      if (!linkVerified) {
+        console.warn(`[ServiceNow LIVE UPDATE] Issue ${issueSysId} created but link to assessment ${payload.assessmentInstanceSysId} could not be verified.`);
+      }
+
+      console.log(`[ServiceNow LIVE UPDATE] Created issue ${issueSysId} for risk ${payload.riskSysId}${linkVerified ? ' (linked)' : ' (link NOT verified)'}`);
+      return { verified: verified && linkVerified, issueSysId };
+    } catch (e: any) {
+      console.warn(`[ServiceNow LIVE UPDATE] Failed to create issue for risk ${payload.riskSysId}: ${e.message}`);
+      return { verified: false, issueSysId: '' };
+    }
+  }
+
+  // Creates one Action Plan (sn_grc_task, labeled "Action Plans" on the
+  // instance, extends the standard Planned Task class) linked back to an
+  // issue via its own 'issue' reference field — confirmed live this is a
+  // related child record, not a field on sn_grc_issue itself.
+  //
+  // 'state' and 'assigned_to' are deliberately NOT set here: confirmed live
+  // that state is computed by platform logic regardless of what is sent (a
+  // literal state=1/"Open" write was silently overridden to "Respond"), and
+  // assigned_to silently stayed empty even when set to the same value that
+  // DID land in u_action_plan_owner right next to it — most likely an
+  // assignment_group-membership validation this task never satisfies. Rather
+  // than send values that look controlled but demonstrably aren't, only
+  // fields confirmed to actually persist as sent are written.
+  async createActionPlanTask(payload: {
+    issueSysId: string;
+    title: string;
+    description: string;
+    ownerSysId: string;
+    prioritySn: string;
+  }): Promise<{ verified: boolean; taskSysId: string }> {
+    if (!this.useLive) return { verified: true, taskSysId: 'mock_task' };
+
+    try {
+      const taskPayload: Record<string, any> = {
+        issue: payload.issueSysId,
+        short_description: payload.title,
+        description: payload.description
+      };
+      if (payload.ownerSysId) taskPayload.u_action_plan_owner = payload.ownerSysId;
+      if (payload.prioritySn) taskPayload.priority = payload.prioritySn;
+
+      const persisted = await this.postRecord('sn_grc_task', taskPayload);
+      const taskSysId = getValue(persisted.sys_id);
+      if (!taskSysId) {
+        console.warn(`[ServiceNow LIVE UPDATE] Action plan task creation for issue ${payload.issueSysId} returned no sys_id.`);
+        return { verified: false, taskSysId: '' };
+      }
+
+      const requiredFields = ['issue', 'short_description'];
+      if (payload.ownerSysId) requiredFields.push('u_action_plan_owner');
+      const verified = this.isVerified(persisted, requiredFields);
+      if (!verified) {
+        console.warn(`[ServiceNow LIVE UPDATE] Action plan task ${taskSysId} created but one or more fields could not be verified.`);
+      }
+
+      console.log(`[ServiceNow LIVE UPDATE] Created action plan task ${taskSysId} for issue ${payload.issueSysId}`);
+      return { verified, taskSysId };
+    } catch (e: any) {
+      console.warn(`[ServiceNow LIVE UPDATE] Failed to create action plan task for issue ${payload.issueSysId}: ${e.message}`);
+      return { verified: false, taskSysId: '' };
+    }
+  }
+
+  async writeControlJustificationSummary(instanceSysId: string, text: string): Promise<boolean> {
+    if (!this.useLive) return true;
+    try {
+      const persisted = await this.putRecord('sn_risk_advanced_risk_assessment_instance', instanceSysId, { control_justification: text });
+      const verified = this.isVerified(persisted, ['control_justification']);
+      console.log(`[ServiceNow LIVE UPDATE] ${verified ? 'Wrote and verified' : 'Wrote but could NOT verify'} control_justification on instance ${instanceSysId}.`);
+      return verified;
+    } catch (e: any) {
+      console.warn(`[ServiceNow LIVE UPDATE] Failed to write control_justification: ${e.message}`);
+      return false;
+    }
+  }
+
+  async writeResidualJustification(instanceSysId: string, text: string): Promise<boolean> {
+    if (!this.useLive) return true;
+    try {
+      const persisted = await this.putRecord('sn_risk_advanced_risk_assessment_instance', instanceSysId, { residual_justification: text });
+      const verified = this.isVerified(persisted, ['residual_justification']);
+      console.log(`[ServiceNow LIVE UPDATE] ${verified ? 'Wrote and verified' : 'Wrote but could NOT verify'} residual_justification on instance ${instanceSysId}.`);
+      return verified;
     } catch (e: any) {
       console.warn(`[ServiceNow LIVE UPDATE] Failed to write residual_justification: ${e.message}`);
+      return false;
     }
   }
 
   // Instance-level executive narrative for inherent risk factors, symmetric to
   // writeControlJustificationSummary — duck-typed the same way, called by
   // InherentAssessmentAgent once all factors are answered.
-  async writeInherentJustificationSummary(instanceSysId: string, text: string): Promise<void> {
-    if (!this.useLive) return;
+  async writeInherentJustificationSummary(instanceSysId: string, text: string): Promise<boolean> {
+    if (!this.useLive) return true;
     try {
-      await this.putRecord('sn_risk_advanced_risk_assessment_instance', instanceSysId, { inherent_justification: text });
-      console.log(`[ServiceNow LIVE UPDATE] Wrote inherent_justification on instance ${instanceSysId}.`);
+      const persisted = await this.putRecord('sn_risk_advanced_risk_assessment_instance', instanceSysId, { inherent_justification: text });
+      const verified = this.isVerified(persisted, ['inherent_justification']);
+      console.log(`[ServiceNow LIVE UPDATE] ${verified ? 'Wrote and verified' : 'Wrote but could NOT verify'} inherent_justification on instance ${instanceSysId}.`);
+      return verified;
     } catch (e: any) {
       console.warn(`[ServiceNow LIVE UPDATE] Failed to write inherent_justification: ${e.message}`);
+      return false;
     }
   }
 
@@ -971,14 +1257,99 @@ export class ServiceNowAdapter extends BaseGRCAdapter {
   // (matched, no genuine match, or no controls exist to evaluate), unlike
   // writeRiskControlMapping itself which only fires when there's an actual
   // mapping to persist.
-  async writeRiskMappingSummary(riskSysId: string, text: string): Promise<void> {
-    if (!this.useLive) return;
+  async writeRiskMappingSummary(riskSysId: string, text: string): Promise<boolean> {
+    if (!this.useLive) return true;
     try {
-      await this.putRecord('sn_risk_risk', riskSysId, { u_ai_recommendation: text });
-      console.log(`[ServiceNow LIVE UPDATE] Wrote u_ai_recommendation on risk ${riskSysId}.`);
+      const persisted = await this.putRecord('sn_risk_risk', riskSysId, { u_ai_recommendation: text });
+      const verified = this.isVerified(persisted, ['u_ai_recommendation']);
+      console.log(`[ServiceNow LIVE UPDATE] ${verified ? 'Wrote and verified' : 'Wrote but could NOT verify'} u_ai_recommendation on risk ${riskSysId}.`);
+      return verified;
     } catch (e: any) {
       console.warn(`[ServiceNow LIVE UPDATE] Failed to write u_ai_recommendation: ${e.message}`);
+      return false;
     }
+  }
+
+  // ── Async integrity scan (duck-typed, called on a schedule, not per-run) ──
+  // The synchronous writeVerified() check in agents.ts catches a bad write the
+  // instant it happens. This catches DRIFT — a field that was fine right after
+  // the write but got cleared by something else afterward (confirmed possible:
+  // the inherent_justification clearing bug). Scans recently-touched records
+  // for "rated but no rationale" and flags each one directly in the empty
+  // field itself, so it surfaces exactly where a reviewer would look for it —
+  // no separate alerting channel required to see something's wrong.
+  async scanForIntegrityIssues(sinceHours: number): Promise<Array<{ recordId: string; recordType: string; issue: string; context: string }>> {
+    const NO_COMMENT_REQUIRED_FACTOR_CLASSES = new Set([
+      'sn_risk_advanced_group_factor',
+      'sn_risk_advanced_automated_query_factor',
+      'sn_risk_advanced_automated_scripted_factor'
+    ]);
+    if (!this.useLive) return [];
+    // Findings are reported for developer/dashboard visibility only — this scan
+    // never writes into ServiceNow itself. Earlier it flagged the empty field
+    // in-place, but that surfaced developer-facing "please re-run this" text to
+    // business users viewing the record, which isn't appropriate for them to see.
+    const findings: Array<{ recordId: string; recordType: string; issue: string; context: string }> = [];
+
+    try {
+      const responses = await this.queryTable<any>('sn_risk_advanced_risk_assessment_instance_response', {
+        sysparm_query: `sys_updated_on>=javascript:gs.hoursAgo(${sinceHours})^factor_responseISNOTEMPTY^additional_commentsISEMPTY`,
+        sysparm_fields: 'sys_id,factor,assessment_instance_id,factor_response'
+      });
+
+      for (const r of responses) {
+        const factorId = getValue(r.factor);
+        if (!factorId) continue;
+        // Exclude factor classes that don't get a human-written comment by design:
+        // group/rollup factors (e.g. Likelihood, Impact GRC — computed aggregates),
+        // and automated query/scripted factors (e.g. "Design effectiveness
+        // implementation of controls" — system-computed, not manually rated).
+        // Confirmed live: this instance has 15+ automated-factor responses with a
+        // rating and no comment that would otherwise false-positive here.
+        const factDefs = await this.queryTable<any>('sn_risk_advanced_factor', { sysparm_query: `sys_id=${factorId}`, sysparm_fields: 'sys_class_name' });
+        const factorClass = factDefs[0] ? getValue(factDefs[0].sys_class_name) : '';
+        if (NO_COMMENT_REQUIRED_FACTOR_CLASSES.has(factorClass)) continue;
+
+        const rowSysId = getValue(r.sys_id);
+        const issue = `Rated (factor_response=${getValue(r.factor_response)}) but additional_comments is empty`;
+        findings.push({ recordId: rowSysId, recordType: 'factor-response', issue, context: `factor: ${getDisplayValue(r.factor)}, instance: ${getValue(r.assessment_instance_id)}` });
+      }
+    } catch (e: any) {
+      console.warn(`[ServiceNowAdapter] Integrity scan (response rows) failed: ${e.message}`);
+    }
+
+    try {
+      const instances = await this.queryTable<any>('sn_risk_advanced_risk_assessment_instance', {
+        sysparm_query: `sys_updated_on>=javascript:gs.hoursAgo(${sinceHours})`,
+        sysparm_fields: 'sys_id,number,inherent_justification,control_justification'
+      });
+
+      for (const inst of instances) {
+        const instId = getValue(inst.sys_id);
+
+        const ratedInherent = await this.queryTable<any>('sn_risk_advanced_risk_assessment_instance_response', {
+          sysparm_query: `assessment_instance_id=${instId}^controlISEMPTY^factor_responseISNOTEMPTY`,
+          sysparm_fields: 'sys_id', sysparm_limit: '1'
+        });
+        if (ratedInherent.length > 0 && !getValue(inst.inherent_justification)) {
+          const issue = 'Has rated inherent factors but inherent_justification is empty';
+          findings.push({ recordId: instId, recordType: 'assessment-instance', issue, context: `instance: ${getDisplayValue(inst.number)}` });
+        }
+
+        const ratedControl = await this.queryTable<any>('sn_risk_advanced_risk_assessment_instance_response', {
+          sysparm_query: `assessment_instance_id=${instId}^controlISNOTEMPTY^factor_responseISNOTEMPTY`,
+          sysparm_fields: 'sys_id', sysparm_limit: '1'
+        });
+        if (ratedControl.length > 0 && !getValue(inst.control_justification)) {
+          const issue = 'Has rated controls but control_justification is empty';
+          findings.push({ recordId: instId, recordType: 'assessment-instance', issue, context: `instance: ${getDisplayValue(inst.number)}` });
+        }
+      }
+    } catch (e: any) {
+      console.warn(`[ServiceNowAdapter] Integrity scan (instances) failed: ${e.message}`);
+    }
+
+    return findings;
   }
 
   async writeFailure(rowSysId: string, reason: string): Promise<void> {
@@ -1017,6 +1388,7 @@ export class ServiceNowAdapter extends BaseGRCAdapter {
     html?: string;
     riskSysId?: string;
     assessmentNumber?: string;
+    summary?: string;
   }): Promise<void> {
     if (!this.useLive) {
       // In mock mode, just log to console — no HTTP call needed.
@@ -1030,6 +1402,11 @@ export class ServiceNowAdapter extends BaseGRCAdapter {
         u_name:  payload.agentName,
         u_trace: traceHtml
       };
+      // u_ema_audit_summary is a plain string field (max 2000 chars) — no
+      // markup, unlike u_trace which is HTML.
+      if (payload.summary) {
+        postPayload.u_ema_audit_summary = payload.summary.slice(0, 2000);
+      }
 
       if (payload.agentName === 'RiskControlMappingAgent') {
         postPayload.u_risk = payload.targetId;
@@ -1070,5 +1447,65 @@ export class ServiceNowAdapter extends BaseGRCAdapter {
       `<b>Results Summary:</b><br>`,
       `<pre style="font-size:11px;background:#f5f5f5;padding:8px;border-radius:4px;">${resultsJson}</pre>`
     ].join('');
+  }
+
+  // ============================================================================
+  // Verification layer support (verification_agent.ts) — three narrowly-scoped
+  // methods, none of which touch anything the producer agents or their own
+  // observability write (writeObservabilityTrace, above) rely on.
+  // ============================================================================
+
+  /** Locates the u_ema_audit_trail row a producer agent's run just created, so the
+   * verification agent knows which row's u_verification_layer_output to fill in. */
+  async findLatestAuditTrailRow(agentName: string, riskAssessmentNumber: string): Promise<string | null> {
+    if (!this.useLive) return null;
+    try {
+      const rows = await this.queryTable<any>('u_ema_audit_trail', {
+        sysparm_query: `u_name=${agentName}^u_risk_assessment_number=${riskAssessmentNumber}^ORDERBYDESCsys_created_on`,
+        sysparm_fields: 'sys_id',
+        sysparm_limit: '1'
+      });
+      return rows.length > 0 ? getValue(rows[0].sys_id) : null;
+    } catch (e: any) {
+      console.warn(`[Verification Layer] Failed to locate audit trail row: ${e.message}`);
+      return null;
+    }
+  }
+
+  /** Writes ONLY u_verification_layer_output — the verification agent must never
+   * touch u_trace, u_ema_audit_summary, or any other field on this row. */
+  async writeVerificationLayerOutput(auditTrailRowSysId: string, html: string): Promise<void> {
+    if (!this.useLive) {
+      console.log(`[Verification Layer] (mock) would write to ${auditTrailRowSysId}`);
+      return;
+    }
+    try {
+      await this.putRecord('u_ema_audit_trail', auditTrailRowSysId, { u_verification_layer_output: html });
+      console.log(`[Verification Layer] Wrote verification output to u_ema_audit_trail ${auditTrailRowSysId}`);
+    } catch (e: any) {
+      console.warn(`[Verification Layer] Failed to write verification output: ${e.message}`);
+    }
+  }
+
+  /** Reads back what a producer agent actually persisted on a response row — the
+   * "claim" the verification agent checks, read fresh rather than trusted from
+   * the producer's own in-memory result. */
+  async getResponseRowScore(rowSysId: string): Promise<{ score: number | null; comments: string } | null> {
+    if (!this.useLive) return null;
+    try {
+      const rows = await this.queryTable<any>('sn_risk_advanced_risk_assessment_instance_response', {
+        sysparm_query: `sys_id=${rowSysId}`,
+        sysparm_fields: 'qualitative_response,additional_comments'
+      });
+      if (rows.length === 0) return null;
+      const raw = getValue(rows[0].qualitative_response);
+      return {
+        score: raw ? parseInt(raw, 10) : null,
+        comments: getDisplayValue(rows[0].additional_comments) || ''
+      };
+    } catch (e: any) {
+      console.warn(`[Verification Layer] Failed to read response row score: ${e.message}`);
+      return null;
+    }
   }
 }

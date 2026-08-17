@@ -701,7 +701,7 @@ export class SalesforceAdapter extends BaseGRCAdapter {
     evidenceSummary: string,
     auditTrail: string,   // ServiceNow-specific field; ignored on Salesforce
     fingerprint: string
-  ): Promise<void> {
+  ): Promise<boolean> {
     if (this.useLive) {
       try {
         // Map rating label to Salesforce picklist values
@@ -722,7 +722,7 @@ export class SalesforceAdapter extends BaseGRCAdapter {
         console.error(`[SalesforceAdapter] writeControlEffectiveness failed for ${rowSysId}: ${e.message}`);
         throw e;
       }
-      return;
+      return true;
     }
     const row = sf_assessment_factors.find(item => item.Id === rowSysId);
     if (row) {
@@ -730,7 +730,9 @@ export class SalesforceAdapter extends BaseGRCAdapter {
       row.Comments__c = evidenceSummary;
       row.Hash__c = fingerprint;
       console.log(`[Salesforce DB UPDATE] Object [Assessment_Factor__c] row [${rowSysId}] -> Score__c: ${score}, Hash__c: "${fingerprint.substring(0,25)}...", Comments__c: [Written]`);
+      return true;
     }
+    return false;
   }
 
   // --------------------------------------------------------------------------
@@ -745,14 +747,14 @@ export class SalesforceAdapter extends BaseGRCAdapter {
     justification: string,
     comment: string,      // plain text structured comment
     auditTrail: string    // HTML audit trail (ServiceNow-specific; ignored here)
-  ): Promise<void> {
+  ): Promise<boolean> {
     if (this.useLive) {
       try {
         // Mock suffix IDs fall through to the live path since the real IDs are Salesforce IDs now
         if (rowSysId.endsWith('_impact') || rowSysId.endsWith('_likelihood')) {
           // Should not happen in live mode — log a warning
           console.warn(`[SalesforceAdapter] writeInherentFactor called with mock suffix ID in LIVE mode: ${rowSysId}. Skipping.`);
-          return;
+          return false;
         }
 
         // Map rating label to band number and score range
@@ -775,7 +777,7 @@ export class SalesforceAdapter extends BaseGRCAdapter {
         console.log(`[Salesforce LIVE UPDATE] Updated Risk__Risk_Assessment_Rating__c ${rowSysId}`);
         console.log(`  Rating: ${ratingLabel} | Band: ${bandData.band} | Best: ${bandData.bestCase} | Value: ${bandData.value} | Worst: ${bandData.worstCase}`);
         console.log(`  Justification: ${comment.substring(0, 200)}...`);
-        return;
+        return true;
       } catch (e: any) {
         console.error(`[SalesforceAdapter] writeInherentFactor failed for ${rowSysId}: ${e.message}`);
         throw e;
@@ -786,7 +788,7 @@ export class SalesforceAdapter extends BaseGRCAdapter {
     if (rowSysId.endsWith('_impact') || rowSysId.endsWith('_likelihood')) {
       console.log(`[Salesforce DB UPDATE] Mock Inherent Rating [${rowSysId}] -> Score: ${score}, Band: ${ratingLabel}`);
       console.log(`  Comments:\n${comment}`);
-      return;
+      return true;
     }
     const row = sf_assessment_factors.find(item => item.Id === rowSysId);
     if (row) {
@@ -794,7 +796,9 @@ export class SalesforceAdapter extends BaseGRCAdapter {
       row.Comments__c = comment;
       console.log(`[Salesforce DB UPDATE] Object [Assessment_Factor__c] row [${rowSysId}] -> Score__c: ${score}`);
       console.log(`  Comments:\n${comment}`);
+      return true;
     }
+    return false;
   }
 
   // --------------------------------------------------------------------------
@@ -806,7 +810,7 @@ export class SalesforceAdapter extends BaseGRCAdapter {
     justification: string,
     gaps: string,
     recommendations: string
-  ): Promise<void> {
+  ): Promise<boolean> {
     if (this.useLive) {
       try {
         const created: string[] = [];
@@ -828,12 +832,13 @@ export class SalesforceAdapter extends BaseGRCAdapter {
         console.error(`[SalesforceAdapter] writeRiskControlMapping failed: ${e.message}`);
         throw e;
       }
-      return;
+      return true;
     }
     matchedControls.forEach(ctrl => {
       sf_control_mappings.push({ Risk__c: riskSysId, Control__c: ctrl.sysId });
     });
     console.log(`[Salesforce DB UPDATE] Created ${matchedControls.length} entries in Risk_Control_Mapping__c. Added AI feedback summary to Risk__c: ${riskSysId}`);
+    return true;
   }
 
   // --------------------------------------------------------------------------
