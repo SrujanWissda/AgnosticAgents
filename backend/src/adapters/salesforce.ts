@@ -874,17 +874,17 @@ export class SalesforceAdapter extends BaseGRCAdapter {
     try {
       const token = await this.getAccessToken();
       // Try to create a dedicated EMA audit trail record first
-      const payload = {
-        Risk__Assessment_Record_Id__c: recordSysId,
-        Risk__Assessment_Type__c: assessmentType,
-        Risk__Record_Type__c: recordType,
-        Risk__Audit_Trail_Details__c: auditTrailHtml,
-        Risk__Created_Date__c: new Date().toISOString()
+      // Note: Using Ema_Audit_Trail__c object with standard field naming
+      const payload: any = {
+        Assessment_Record_Id__c: recordSysId,
+        Assessment_Type__c: assessmentType,
+        Record_Type__c: recordType,
+        Audit_Trail_Details__c: auditTrailHtml
       };
 
       try {
         const response = await axios.post(
-          `${this.instanceUrl}/services/data/v60.0/sobjects/Risk__EMA_Audit_Trail__c`,
+          `${this.instanceUrl}/services/data/v60.0/sobjects/Ema_Audit_Trail__c`,
           payload,
           {
             headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
@@ -897,7 +897,7 @@ export class SalesforceAdapter extends BaseGRCAdapter {
       } catch (trailErr: any) {
         // If EMA object doesn't exist, fall back to storing in assessment record
         if (trailErr.response?.status === 404 || trailErr.message?.includes('sobject type')) {
-          console.warn(`[SalesforceAdapter] ⚠️  EMA_Audit_Trail__c object not found. Using fallback: storing audit trail in assessment record.`);
+          console.warn(`[SalesforceAdapter] ⚠️  Ema_Audit_Trail__c object not found. Using fallback: storing audit trail in assessment record.`);
 
           // Fallback: append audit trail to the assessment record's audit/notes field
           // For Control Assessment: append to Risk__Audit_Trail_Notes__c
