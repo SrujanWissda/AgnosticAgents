@@ -176,15 +176,21 @@ export class SalesforceAdapter extends BaseGRCAdapter {
     const token = await this.getAccessToken();
     const t0 = Date.now();
     try {
+      console.log(`[Salesforce REST UPDATE] ${sobjectName}/${recordId} with fields: ${Object.keys(data).join(', ')}`);
       await axios.patch(
-        `${this.instanceUrl}/services/data/v60.0/sobjects/${sobjectName}/${recordId}`,
+        `${this.instanceUrl}/services/data/v65.0/sobjects/${sobjectName}/${recordId}`,
         data,
         { headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' }, timeout: 15000 }
       );
+      console.log(`[Salesforce REST UPDATE] ✅ Success: ${sobjectName}/${recordId}`);
       recordSpan('platform.update', t0, 'ok', { platform: 'salesforce', object: sobjectName, recordId });
     } catch (e: any) {
+      console.error(`[Salesforce REST UPDATE] ❌ Failed: ${sobjectName}/${recordId}`);
       if (e.response?.data) {
+        console.error(`[Salesforce REST Update Error] Status:`, e.response.status);
         console.error(`[Salesforce REST Update Error] Details:`, JSON.stringify(e.response.data));
+      } else {
+        console.error(`[Salesforce REST Update Error] Message:`, e.message);
       }
       recordSpan('platform.update', t0, 'error', { platform: 'salesforce', object: sobjectName, recordId, error: e.message });
       throw e;
