@@ -1569,7 +1569,7 @@ export class RiskControlMappingAgent {
           const allMatches = this.dedupeBySysId([...carriedMatches, ...critiqued.matches]);
 
           result = allMatches.length === 0
-            ? this.finishNoMatch(risk, entityLabel, controls.length, critiqued.rejected, draft.justification, draft.gaps, draft.recommendation, draft.coverageNote)
+            ? await this.finishNoMatch(risk, riskSysId, entityLabel, controls.length, critiqued.rejected, draft.justification, draft.gaps, draft.recommendation, tracer, draft.coverageNote)
             : await this.finishMatched(risk, riskSysId, entityLabel, controls.length, allMatches, critiqued.matches, critiqued.rejected, draft.justification, draft.gaps, draft.recommendation, tracer, draft.coverageNote);
         }
       }
@@ -2092,6 +2092,16 @@ export class RiskControlMappingAgent {
 
     tracer.log('RESPONSE', { path: 'suggestNewControls', suggestionsCount: suggestions.length });
 
+    await writeVerified(tracer, `risk-control mapping (no existing controls) for ${risk.sysId}`, () =>
+      this.adapter.writeRiskControlMapping(
+        risk.sysId,
+        [],
+        'No controls currently exist in the library for this business unit.',
+        `No controls exist in the library to cover risk: ${risk.name}.`,
+        suggestions.map(s => `${s.name}: ${s.description}`).join('\n')
+      )
+    );
+
     const narrative = [
       `${htmlLabel('SUMMARY:')} No controls exist for ${htmlEscape(entityLabel.toLowerCase())} "${htmlEscape(risk.profileName)}".`,
       `${htmlLabel('SUGGESTED CONTROLS TO CREATE:')}<br>${suggestions.map(c => htmlChoiceLine(c.name, c.description, true)).join('<br>')}`,
@@ -2160,10 +2170,20 @@ export class RiskControlMappingAgent {
     };
   }
 
-  private finishNoMatch(
-    risk: Risk, entityLabel: string, totalControls: number, rejected: ResolvedControl[],
-    justification: string, gaps: string, recommendation: string, coverageNote: string = ''
+  private async finishNoMatch(
+    risk: Risk, riskSysId: string, entityLabel: string, totalControls: number, rejected: ResolvedControl[],
+    justification: string, gaps: string, recommendation: string, tracer: AgentTracer, coverageNote: string = ''
   ) {
+    const verified = await writeVerified(tracer, `risk-control mapping (no match) for ${riskSysId}`, () =>
+      this.adapter.writeRiskControlMapping(
+        riskSysId,
+        [],
+        this.formatText(justification),
+        this.formatText(gaps),
+        this.formatText(recommendation)
+      )
+    );
+
     const narrative = [
       `${htmlLabel('SUMMARY:')} Reviewed ${totalControls} control(s) and found none that genuinely mitigate this risk.`,
       `${htmlLabel('RATIONALE — why each was rejected:')}<br>${htmlEscape(justification || 'Not provided')}`,
@@ -2184,7 +2204,8 @@ export class RiskControlMappingAgent {
         justification,
         gaps,
         recommendations: recommendation,
-        narrative
+        narrative,
+        verified
       }
     };
   }

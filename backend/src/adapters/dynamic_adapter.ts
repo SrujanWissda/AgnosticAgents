@@ -794,9 +794,16 @@ export class DynamicAdapter extends BaseGRCAdapter {
       const designMap: Record<string, string> = {
         Satisfactory: 'Effective',
         'Needs Improvement': 'Adequate',
-        Weak: 'Inadequate'
+        Weak: 'Inadequate',
+        'Needs Work': 'Adequate',
+        Ineffective: 'Inadequate'
       };
-      if (designMap[ratingLabel]) data['Risk__Control_Effectiveness__c'] = designMap[ratingLabel];
+      const ratingVal = designMap[ratingLabel] || ratingLabel;
+      if (ratingVal) {
+        data['Risk__Control_Effectiveness__c'] = ratingVal; // Design Rating
+        data['Risk__Anticipated_Control_Effectiveness__c'] = ratingVal; // Performance Rating
+        data['Risk__Overall_Control_Assessment__c'] = ratingVal; // Overall Rating
+      }
     }
 
     const ok = await this.restUpdate(t.sourceTableName, rowSysId, data);

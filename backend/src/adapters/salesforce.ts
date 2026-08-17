@@ -740,17 +740,21 @@ export class SalesforceAdapter extends BaseGRCAdapter {
         // Map rating label to Salesforce picklist values
         const designMap: Record<string, string> = {
           'Satisfactory': 'Effective',
-          'Needs Improvement': 'Partially Effective',
-          'Ineffective': 'Ineffective',
-          'Needs Work': 'Partially Effective'
+          'Needs Improvement': 'Adequate',
+          'Needs Work': 'Adequate',
+          'Weak': 'Inadequate',
+          'Ineffective': 'Inadequate'
         };
+        const ratingVal = designMap[ratingLabel] || ratingLabel;
         await this.restUpdate('Risk__Control_Assessment__c', rowSysId, {
-          Risk__Control_Effectiveness__c: designMap[ratingLabel] || ratingLabel,
-          Risk__Justification__c: `[AI] ${justification}\n\nEvidence: ${evidenceSummary}`,
+          Risk__Control_Effectiveness__c: ratingVal, // Design Rating
+          Risk__Anticipated_Control_Effectiveness__c: ratingVal, // Performance Rating
+          Risk__Overall_Control_Assessment__c: ratingVal, // Overall Rating
+          Risk__Justification__c: `[AI] ${justification}\n\nEvidence Summary:\n${evidenceSummary}`,
           Risk__Control_Effectiveness_Value__c: score,
           Risk__Assessment_Date__c: new Date().toISOString().split('T')[0]
         });
-        console.log(`[Salesforce LIVE UPDATE] Updated Risk__Control_Assessment__c ${rowSysId} → ${ratingLabel}`);
+        console.log(`[Salesforce LIVE UPDATE] Updated Risk__Control_Assessment__c ${rowSysId} → ${ratingLabel} (Design, Performance & Overall set)`);
 
         // Create EMA audit trail record linked to this control assessment
         if (auditTrail) {
