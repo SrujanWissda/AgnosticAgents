@@ -62,6 +62,19 @@ export class DynamicAdapter extends BaseGRCAdapter {
     return this.config.platformName;
   }
 
+  // Field metadata for smart formatting (discovered during schema discovery)
+  getFieldMetadata() {
+    return this.config.fieldMetadata;
+  }
+
+  getTerminology() {
+    return this.config.terminology;
+  }
+
+  getFieldRelationships() {
+    return this.config.fieldRelationships;
+  }
+
   // --------------------------------------------------------------------------
   // Query/write plumbing (Salesforce SOQL — first supported connection type)
   // --------------------------------------------------------------------------
@@ -756,13 +769,13 @@ export class DynamicAdapter extends BaseGRCAdapter {
     evidenceSummary: string,
     _auditTrail: string,
     fingerprint: string
-  ): Promise<void> {
+  ): Promise<boolean> {
     // Write back to the same table getControlFactorRows read from.
     const t = this.factorTableWith('control', 'assessment');
     const wh = t?.writeHeuristics;
     if (!t || !wh || (!wh.scoreField && !wh.justificationField)) {
       console.warn(`[DynamicAdapter:${this.config.platformName}] No write-back fields detected for Factor table; skipping write for row ${rowSysId} (would have written rating '${ratingLabel}').`);
-      return;
+      return false;
     }
     const data: Record<string, any> = {};
     if (wh.scoreField) data[wh.scoreField] = score;
@@ -790,6 +803,7 @@ export class DynamicAdapter extends BaseGRCAdapter {
     if (ok) {
       console.log(`[DynamicAdapter:${this.config.platformName}] Updated ${t.sourceTableName} ${rowSysId} -> ${ratingLabel}`);
     }
+    return ok;
   }
 
   async writeInherentFactor(
@@ -798,14 +812,14 @@ export class DynamicAdapter extends BaseGRCAdapter {
     ratingLabel: string,
     justification: string,
     comment: string
-  ): Promise<void> {
+  ): Promise<boolean> {
     // Write back to the same table getAnswerableManualRows read from.
     const t = findAllTables(this.config, 'Factor').find(x => x.relationships.assessment && !x.relationships.control)
       || this.factorTableWith('assessment');
     const wh = t?.writeHeuristics;
     if (!t || !wh || (!wh.scoreField && !wh.justificationField)) {
       console.warn(`[DynamicAdapter:${this.config.platformName}] No write-back fields detected for Factor table; skipping write for row ${rowSysId} (would have written rating '${ratingLabel}').`);
-      return;
+      return false;
     }
     const data: Record<string, any> = {};
     if (wh.scoreField) data[wh.scoreField] = score;
@@ -815,6 +829,7 @@ export class DynamicAdapter extends BaseGRCAdapter {
     if (ok) {
       console.log(`[DynamicAdapter:${this.config.platformName}] Updated ${t.sourceTableName} ${rowSysId} -> ${ratingLabel}`);
     }
+    return ok;
   }
 
   /**
@@ -867,13 +882,14 @@ export class DynamicAdapter extends BaseGRCAdapter {
   async writeRiskControlMapping(
     riskSysId: string,
     matchedControls: Array<{ sysId: string; reason: string }>
-  ): Promise<void> {
+  ): Promise<boolean> {
     const junctionTable = this.deriveRiskControlJunctionTable();
     if (!junctionTable) {
       console.warn(`[DynamicAdapter:${this.config.platformName}] Could not derive a risk-control junction object; ${matchedControls.length} match(es) for risk ${riskSysId} were NOT persisted.`);
-      return;
+      return false;
     }
 
+    let allOk = true;
     for (const ctrl of matchedControls) {
       // Avoid duplicate links if this risk/control pair is already mapped.
       const existing = await this.querySOQL<any>(
@@ -890,8 +906,11 @@ export class DynamicAdapter extends BaseGRCAdapter {
       });
       if (id) {
         console.log(`[DynamicAdapter:${this.config.platformName}] Linked control ${ctrl.sysId} to risk ${riskSysId} (${id}).`);
+      } else {
+        allOk = false;
       }
     }
+    return allOk;
   }
 
   async writeFailure(rowSysId: string, reason: string): Promise<void> {

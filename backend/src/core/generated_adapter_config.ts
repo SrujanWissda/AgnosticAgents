@@ -51,6 +51,31 @@ export interface SampleCheck {
 
 export type ConnectionType = 'salesforce-soql' | 'servicenow-table-api' | 'generic-rest';
 
+// Field-level metadata discovered during schema introspection
+export interface FieldMetadata {
+  sourceTableName: string;
+  sourceFieldName: string;
+  dataType: string; // 'text', 'textarea', 'richtext', 'picklist', 'number', etc.
+  maxCharacters?: number;
+  truncationStrategy?: 'word-boundary' | 'char-limit' | 'none'; // how to truncate if too long
+  description?: string;
+}
+
+// Platform-specific terminology mapping (entity → business unit, etc.)
+export interface PlatformTerminology {
+  [genericTerm: string]: string; // 'entity' → 'business unit'
+}
+
+// Related fields that represent the same concept (e.g., Design + Performance effectiveness)
+export interface FieldRelationship {
+  concept: string; // 'control-effectiveness', 'inherent-assessment', etc.
+  fields: Array<{
+    sourceTableName: string;
+    sourceFieldName: string;
+    roleName: string; // 'design', 'performance', 'overall', etc.
+  }>;
+}
+
 export interface GeneratedAdapterConfig {
   platformName: string;
   connectionType: ConnectionType;
@@ -63,6 +88,12 @@ export interface GeneratedAdapterConfig {
     validated: boolean;
     sampleChecks: SampleCheck[];
   };
+  // NEW: Field metadata for smart writing (character limits, types, truncation)
+  fieldMetadata?: FieldMetadata[];
+  // NEW: Platform terminology mapping (entity → business unit, etc.)
+  terminology?: PlatformTerminology;
+  // NEW: Related fields for concepts (Design + Performance = control effectiveness)
+  fieldRelationships?: FieldRelationship[];
 }
 
 export function configPathFor(platformName: string): string {

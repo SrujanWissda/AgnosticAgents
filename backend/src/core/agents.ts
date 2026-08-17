@@ -1,7 +1,8 @@
 import { BaseGRCAdapter } from '../adapters/base';
 import { BaseLLMClient, ToolDeclaration } from '../llm/llm_client';
-import { Risk, Control, TestEvidence, Factor, MappingResult } from './models';
+import { Risk, Control, TestEvidence, Factor } from './models';
 import { AgentTracer } from './tracer';
+import { FieldMetadataUtils } from './field_metadata_utils';
 
 // ============================================================================
 // Helper: Determinstic Evidence Fingerprinting
@@ -55,11 +56,117 @@ async function withRetry<T>(fn: () => Promise<T | null>, attempts: number): Prom
   return null;
 }
 
+// Helper: a write may report success (HTTP 200/201) while the platform silently
+// drops the field — confirmed live twice this project (risk-control mapping
+// links, instance justification narratives). One retry of the SAME write (not
+// a fresh Gemini call — the content was fine, the platform write wasn't) before
+// logging a loud, visible failure instead of a silent gap in the audit trail.
+async function writeVerified(tracer: AgentTracer, label: string, write: () => Promise<boolean>): Promise<boolean> {
+  let verified = await write();
+  if (!verified) {
+    tracer.log('WARN', { message: `Write not verified for ${label} — retrying once` });
+    verified = await write();
+  }
+  if (!verified) {
+    tracer.log('ERROR', { message: `Write still not verified for ${label} after retry — platform may have silently dropped the field` });
+  }
+  return verified;
+}
+
+// ============================================================================
+// Shared HTML formatting for rich-text ServiceNow fields
+//
+// Confirmed live via sys_dictionary: u_rationale_auditing_purpose,
+// u_ai_recommendation, and u_issue_summarize_ema are `html` type — the only
+// three fields any agent writes into that can render markup at all.
+// additional_comments, inherent_justification, control_justification,
+// residual_justification, and the GRC task/issue `description` fields are
+// plain `string` — putting a tag in one of those renders the literal
+// characters "<b>", not bold text, so those stay plain text everywhere.
+//
+// One small, consistent style reused across every HTML field rather than a
+// different look per agent: a single label color for section headers, plus
+// green/red only where a decision is genuinely binary (matched vs rejected).
+// ============================================================================
+export const HTML_LABEL_COLOR = '#1a3d7c';
+export const HTML_POSITIVE_COLOR = '#1a7f52';
+export const HTML_NEGATIVE_COLOR = '#b23a2e';
+
+/** Bold, colored section label — e.g. htmlLabel('Rating:') */
+export function htmlLabel(text: string): string {
+  return `<b style="color:${HTML_LABEL_COLOR}">${text}</b>`;
+}
+
+/** Escapes plain text for an HTML field and turns newlines into <br>. */
+export function htmlEscape(text: string): string {
+  return (text || '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/\n/g, '<br>');
+}
+
+/** One line in a matched/rejected control or factor breakdown. */
+export function htmlChoiceLine(name: string, reason: string, positive: boolean): string {
+  const color = positive ? HTML_POSITIVE_COLOR : HTML_NEGATIVE_COLOR;
+  const mark = positive ? '✓' : '✗';
+  return `<span style="color:${color}"><b>${mark} ${htmlEscape(name)}</b></span> — ${htmlEscape(reason)}`;
+}
+
+// One-line, plain-text (no markup — u_ema_audit_summary is a plain string
+// field, not HTML) rating tally for the u_ema_audit_trail summary column.
+// Shared by Control Effectiveness and Inherent Assessment, whose per-row
+// results both carry a `rating` and a `verified` flag.
+function buildAssessmentSummary(nounPlural: string, results: Array<{ rating?: string | null; verified?: boolean }>, outcome: string): string {
+  const tally: Record<string, number> = {};
+  let unverified = 0;
+  for (const r of results) {
+    if (r.rating) tally[r.rating] = (tally[r.rating] || 0) + 1;
+    if (r.verified === false) unverified++;
+  }
+  const breakdown = Object.entries(tally).map(([rating, count]) => `${count} ${rating}`).join(', ') || 'no ratings recorded';
+  const verifiedNote = unverified > 0 ? ` ${unverified} write${unverified !== 1 ? 's' : ''} could not be verified.` : '';
+  return `Assessed ${results.length} ${nounPlural}: ${breakdown}. Outcome: ${outcome}.${verifiedNote}`;
+}
+
 // ============================================================================
 // 1. Control Effectiveness Agent
 // ============================================================================
 export class ControlEffectivenessAgent {
-  constructor(private adapter: BaseGRCAdapter, private llm: BaseLLMClient) { }
+  private fieldUtils: FieldMetadataUtils | null;
+  private terminology: { [key: string]: string } | null;
+
+  constructor(private adapter: BaseGRCAdapter, private llm: BaseLLMClient) {
+    const config = (adapter as any).config;
+    this.fieldUtils = config ? new FieldMetadataUtils(config) : null;
+    this.terminology = this.adapter.getTerminology() || null;
+  }
+
+  private formatText(text: string, maxChars = 32768): string {
+    if (!text) return text;
+
+    let result = text;
+    if (this.terminology) {
+      for (const [from, to] of Object.entries(this.terminology)) {
+        const regex = new RegExp(`\\b${from}\\b`, 'gi');
+        result = result.replace(regex, (match) =>
+          match[0] === match[0].toUpperCase() ? to.charAt(0).toUpperCase() + to.slice(1) : to
+        );
+      }
+    }
+
+    if (result.length > maxChars) {
+      const truncated = result.substring(0, maxChars);
+      const lastSpace = truncated.lastIndexOf(' ');
+      return lastSpace > 0 ? truncated.substring(0, lastSpace) : truncated;
+    }
+    return result;
+  }
+
+  private formatForField(text: string, tableName: string, fieldName: string): string {
+    if (!this.fieldUtils) return this.formatText(text);
+    return this.fieldUtils.formatForField(text, tableName, fieldName);
+  }
 
   async execute(instanceSysId: string): Promise<{ success: boolean; message: string; details: any[] }> {
     const tracer = new AgentTracer();
@@ -107,16 +214,20 @@ export class ControlEffectivenessAgent {
         const prior = await this.adapter.getPriorControlAnswer(priorInstanceSysId.sysId, row.controlSysId, row.factorSysId);
         if (prior && prior.fingerprint === fingerprint && prior.factorResponse) {
           const carriedScore = parseInt(prior.factorResponse, 10);
-          await this.adapter.writeControlEffectiveness(
-            row.sysId,
-            carriedScore,
-            prior.ratingLabel,
-            `📋 EMA — Carried forward. No changes in control or tests since last assessment.\nRating: ${prior.ratingLabel}\nPrior reasoning: ${prior.comments}`,
-            prior.comments,
-            prior.comments,
-            fingerprint
+          const formattedComments = this.formatText(prior.comments);
+          const formattedJustification = `📋 EMA — Carried forward. No changes in control or tests since last assessment.\nRating: ${prior.ratingLabel}\nPrior reasoning: ${formattedComments}`;
+          const verified = await writeVerified(tracer, `control ${row.controlName} (carried forward)`, () =>
+            this.adapter.writeControlEffectiveness(
+              row.sysId,
+              carriedScore,
+              prior.ratingLabel,
+              this.formatText(formattedJustification),
+              formattedComments,
+              formattedComments,
+              fingerprint
+            )
           );
-          results.push({ control: row.controlName, action: 'copied', rating: prior.ratingLabel, justification: prior.comments });
+          results.push({ control: row.controlName, action: 'copied', rating: prior.ratingLabel, justification: prior.comments, verified });
           tracer.log('COPIED', { control: row.controlName, rating: prior.ratingLabel, justification: prior.comments });
           continue;
         }
@@ -271,34 +382,33 @@ export class ControlEffectivenessAgent {
 
         const auditTrail = [
           `🔍 EMA INVESTIGATION (TECHNICAL / AUDIT TRAIL) — Control Effectiveness Assessment`,
-          `Rating: ${draft.rating}`,
-          `Confidence: ${confidence}`,
-          toolsUsedLine,
-          `WHAT WAS SEARCHED (table-level detail):`,
-          `&nbsp;&nbsp;1. Control details — searched sn_compliance_control (control record) and found: "${item.controlName}"`,
-          `&nbsp;&nbsp;2. Control tests — searched sn_audit_control_test (Control Tests related list on the control) and found ${testCount} record${testCount !== 1 ? 's' : ''}: ${testDetailTech}`,
-          `&nbsp;&nbsp;3. Associated issues — searched sn_grc_issue (Issue Management module, same records as the Associated Issues tab on the control) and found ${allOpenIssues.length} record${allOpenIssues.length !== 1 ? 's' : ''} not yet Closed Complete: ${issueDetailTech}`,
-          `&nbsp;&nbsp;4. Prior assessment history — searched ${priorLineTech}`,
-          `CONCLUSION:`,
-          draft.justification,
-          `Model: gemini-3.5-flash (Ema) · Assessed: ${formattedDate}`
-        ].join('<br><br>').replace(
-          // Add single <br> between Rating and Confidence (they should sit together)
-          `Rating: ${draft.rating}<br><br>Confidence: ${confidence}`,
-          `Rating: ${draft.rating}<br>Confidence: ${confidence}`
+          `${htmlLabel('Rating:')} ${draft.rating}<br>${htmlLabel('Confidence:')} ${confidence}`,
+          htmlEscape(toolsUsedLine),
+          htmlLabel('WHAT WAS SEARCHED (table-level detail):'),
+          [
+            `&nbsp;&nbsp;1. Control details — searched sn_compliance_control (control record) and found: "${htmlEscape(item.controlName)}"`,
+            `&nbsp;&nbsp;2. Control tests — searched sn_audit_control_test (Control Tests related list on the control) and found ${testCount} record${testCount !== 1 ? 's' : ''}: ${htmlEscape(testDetailTech)}`,
+            `&nbsp;&nbsp;3. Associated issues — searched sn_grc_issue (Issue Management module, same records as the Associated Issues tab on the control) and found ${allOpenIssues.length} record${allOpenIssues.length !== 1 ? 's' : ''} not yet Closed Complete: ${htmlEscape(issueDetailTech)}`,
+            `&nbsp;&nbsp;4. Prior assessment history — searched ${htmlEscape(priorLineTech)}`
+          ].join('<br>'),
+          `${htmlLabel('CONCLUSION:')}<br>${htmlEscape(draft.justification)}`,
+          `<i>Model: gemini-3.5-flash (Ema) · Assessed: ${formattedDate}</i>`
+        ].join('<br><br>');
+
+        const formattedJustification = this.formatText(draft.justification);
+        const verified = await writeVerified(tracer, `control ${item.controlName}`, () =>
+          this.adapter.writeControlEffectiveness(
+            item.rowSysId,
+            draft.score,
+            draft.rating,
+            formattedJustification,
+            this.formatText(summary),
+            auditTrail,
+            item.fingerprint
+          )
         );
 
-        await this.adapter.writeControlEffectiveness(
-          item.rowSysId,
-          draft.score,
-          draft.rating,
-          draft.justification,
-          summary,
-          auditTrail,
-          item.fingerprint
-        );
-
-        results.push({ control: item.controlName, action: 'assessed', rating: draft.rating, justification: draft.justification });
+        results.push({ control: item.controlName, action: 'assessed', rating: draft.rating, justification: draft.justification, verified });
       }));
     }
 
@@ -310,7 +420,7 @@ export class ControlEffectivenessAgent {
     // so this step is silently skipped there rather than treated as an error.
     const getContext = (this.adapter as any).getInstanceJustificationContext;
     if (typeof getContext === 'function') {
-      await this.synthesizeInstanceJustifications(inst.sysId, results, getContext);
+      await this.synthesizeInstanceJustifications(inst.sysId, results, getContext, tracer);
     }
 
     // ── Observability: write a trace record to u_ema_audit_trail if adapter supports it ──
@@ -327,7 +437,8 @@ export class ControlEffectivenessAgent {
           results,
           html: tracer.renderHtml('ControlEffectivenessAgent', inst.number || instanceSysId),
           riskSysId: inst.riskSysId,
-          assessmentNumber: inst.number
+          assessmentNumber: inst.number,
+          summary: buildAssessmentSummary('control(s)', results, outcome)
         });
       } catch (_) { /* observability is best-effort — never block the run */ }
     }
@@ -353,7 +464,8 @@ export class ControlEffectivenessAgent {
       inherentJustification: string;
       controlJustification: string;
       calculatedRatings: string[];
-    } | null>
+    } | null>,
+    tracer: AgentTracer
   ): Promise<void> {
     const context = await getContext.call(this.adapter, instanceSysId);
     if (!context) return; // adapter/platform doesn't support this instance concept
@@ -398,8 +510,11 @@ export class ControlEffectivenessAgent {
       // Synthesis is a best-effort enrichment — never block the rest of the run on it.
     }
 
-    if (controlJustification && typeof (this.adapter as any).writeControlJustificationSummary === 'function') {
-      await (this.adapter as any).writeControlJustificationSummary(instanceSysId, controlJustification);
+    const rawWriteControlSummary = (this.adapter as any).writeControlJustificationSummary;
+    if (controlJustification && typeof rawWriteControlSummary === 'function') {
+      await writeVerified(tracer, `instance ${instanceSysId} control_justification`, () =>
+        rawWriteControlSummary.call(this.adapter, instanceSysId, controlJustification)
+      );
     }
 
     // Residual — only meaningful if there's an inherent and/or control narrative to
@@ -438,8 +553,11 @@ export class ControlEffectivenessAgent {
       // Same — best-effort enrichment only.
     }
 
-    if (residualJustification && typeof (this.adapter as any).writeResidualJustification === 'function') {
-      await (this.adapter as any).writeResidualJustification(instanceSysId, residualJustification);
+    const rawWriteResidual = (this.adapter as any).writeResidualJustification;
+    if (residualJustification && typeof rawWriteResidual === 'function') {
+      await writeVerified(tracer, `instance ${instanceSysId} residual_justification`, () =>
+        rawWriteResidual.call(this.adapter, instanceSysId, residualJustification)
+      );
     }
   }
 
@@ -722,7 +840,44 @@ export class ControlEffectivenessAgent {
 // 2. Inherent Assessment Agent
 // ============================================================================
 export class InherentAssessmentAgent {
-  constructor(private adapter: BaseGRCAdapter, private llm: BaseLLMClient) { }
+  private fieldUtils: FieldMetadataUtils | null;
+  private terminology: { [key: string]: string } | null;
+
+  constructor(private adapter: BaseGRCAdapter, private llm: BaseLLMClient) {
+    const config = (adapter as any).config; // DynamicAdapter has config
+    this.fieldUtils = config ? new FieldMetadataUtils(config) : null;
+    this.terminology = this.adapter.getTerminology() || null;
+  }
+
+  // Format text: apply terminology + smart truncation (32768 max for Salesforce textareas)
+  private formatText(text: string, maxChars = 32768): string {
+    if (!text) return text;
+
+    // Apply terminology (entity → business unit, etc.)
+    let result = text;
+    if (this.terminology) {
+      for (const [from, to] of Object.entries(this.terminology)) {
+        const regex = new RegExp(`\\b${from}\\b`, 'gi');
+        result = result.replace(regex, (match) =>
+          match[0] === match[0].toUpperCase() ? to.charAt(0).toUpperCase() + to.slice(1) : to
+        );
+      }
+    }
+
+    // Smart truncate at word boundary
+    if (result.length > maxChars) {
+      const truncated = result.substring(0, maxChars);
+      const lastSpace = truncated.lastIndexOf(' ');
+      return lastSpace > 0 ? truncated.substring(0, lastSpace) : truncated;
+    }
+    return result;
+  }
+
+  // Format text for a specific field: apply terminology + smart truncation
+  private formatForField(text: string, tableName: string, fieldName: string): string {
+    if (!this.fieldUtils) return this.formatText(text);
+    return this.fieldUtils.formatForField(text, tableName, fieldName);
+  }
 
   async execute(instanceSysId: string): Promise<{ success: boolean; message: string; details: any[] }> {
     const tracer = new AgentTracer();
@@ -771,15 +926,22 @@ export class InherentAssessmentAgent {
         const prior = await this.adapter.getPriorControlAnswer(priorInstanceSysId.sysId, '', factor.factorSysId);
         if (prior && prior.factorResponse) {
           const carriedScore = parseInt(prior.factorResponse, 10);
-          await this.adapter.writeInherentFactor(
-            factor.sysId,
-            carriedScore,
-            prior.ratingLabel,
+          const formattedJustification = this.formatForField(
             prior.comments,
-            `📋 EMA — Carried forward from prior closed assessment${priorInstanceSysId.number ? ' ' + priorInstanceSysId.number : ''}. No fresh evaluation this cycle.\nRating: ${prior.ratingLabel}\nPrior reasoning: ${prior.comments}`,
-            prior.comments
+            'Risk__Risk_Assessment_Rating__c',
+            'Risk__Justification__c'
           );
-          results.push({ factor: factor.factorName, action: 'copied', rating: prior.ratingLabel, justification: prior.comments });
+          const verified = await writeVerified(tracer, `factor ${factor.factorName} (carried forward)`, () =>
+            this.adapter.writeInherentFactor(
+              factor.sysId,
+              carriedScore,
+              prior.ratingLabel,
+              formattedJustification,
+              `📋 EMA — Carried forward from prior closed assessment${priorInstanceSysId.number ? ' ' + priorInstanceSysId.number : ''}. No fresh evaluation this cycle.\nRating: ${prior.ratingLabel}\nPrior reasoning: ${this.formatForField(prior.comments, 'Risk__Risk_Assessment_Rating__c', 'Risk__Justification__c')}`,
+              formattedJustification
+            )
+          );
+          results.push({ factor: factor.factorName, action: 'copied', rating: prior.ratingLabel, justification: prior.comments, verified });
           tracer.log('COPIED', { factor: factor.factorName, rating: prior.ratingLabel, justification: prior.comments });
         } else {
           await this.adapter.writeFailure(factor.sysId, 'No prior value available to carry forward.');
@@ -788,12 +950,14 @@ export class InherentAssessmentAgent {
         }
       }
 
-      const writeInherentSummary = (this.adapter as any).writeInherentJustificationSummary;
-      if (typeof writeInherentSummary === 'function') {
-        await writeInherentSummary.call(
-          this.adapter,
-          inst.sysId,
-          `Carried forward from prior closed assessment${priorInstanceSysId.number ? ' ' + priorInstanceSysId.number : ''}. Ratings and supporting rationale were unchanged and reused without a new evaluation this cycle.`
+      const writeInherentSummaryCF = (this.adapter as any).writeInherentJustificationSummary;
+      if (typeof writeInherentSummaryCF === 'function') {
+        await writeVerified(tracer, `instance ${inst.sysId} inherent_justification (carried forward)`, () =>
+          writeInherentSummaryCF.call(
+            this.adapter,
+            inst.sysId,
+            `Carried forward from prior closed assessment${priorInstanceSysId.number ? ' ' + priorInstanceSysId.number : ''}. Ratings and supporting rationale were unchanged and reused without a new evaluation this cycle.`
+          )
         );
       }
 
@@ -813,7 +977,8 @@ export class InherentAssessmentAgent {
             targetId: instanceSysId,
             outcome: 'copied',
             results,
-            html: tracer.renderHtml('InherentAssessmentAgent', inst.number || instanceSysId)
+            html: tracer.renderHtml('InherentAssessmentAgent', inst.number || instanceSysId),
+            summary: buildAssessmentSummary('inherent factor(s)', results, 'copied')
           });
         } catch (_) { /* observability is best-effort — never block the run */ }
       }
@@ -927,32 +1092,33 @@ export class InherentAssessmentAgent {
 
       const auditTrail = [
         `🔍 EMA INVESTIGATION (TECHNICAL / AUDIT TRAIL) — Inherent Risk Factor Assessment`,
-        `Rating: ${draft.rating}`,
-        `Confidence: ${confidence}`,
-        toolsUsedLine,
-        `WHAT WAS SEARCHED (table-level detail):`,
-        `&nbsp;&nbsp;1. ${entitySearchLabel} issues — searched ${techSearchTableLabel}; found ${issueCount} unresolved issue${issueCount !== 1 ? 's' : ''} not Closed Complete`,
-        `&nbsp;&nbsp;2. Relevant issues — ${issueRelevanceLine}`,
-        `CONCLUSION:`,
-        draft.justification,
-        `Model: gemini-3.5-flash (Ema) · Assessed: ${formattedDate}`
-      ].join('<br><br>').replace(
-        `Rating: ${draft.rating}<br><br>Confidence: ${confidence}`,
-        `Rating: ${draft.rating}<br>Confidence: ${confidence}`
-      ).replace(
-        `CONCLUSION:<br><br>${draft.justification}`,
-        `CONCLUSION:<br>${draft.justification}`
-      );
+        `${htmlLabel('Rating:')} ${draft.rating}<br>${htmlLabel('Confidence:')} ${confidence}`,
+        htmlEscape(toolsUsedLine),
+        htmlLabel('WHAT WAS SEARCHED (table-level detail):'),
+        [
+          `&nbsp;&nbsp;1. ${entitySearchLabel} issues — searched ${techSearchTableLabel}; found ${issueCount} unresolved issue${issueCount !== 1 ? 's' : ''} not Closed Complete`,
+          `&nbsp;&nbsp;2. Relevant issues — ${htmlEscape(issueRelevanceLine)}`
+        ].join('<br>'),
+        `${htmlLabel('CONCLUSION:')}<br>${htmlEscape(draft.justification)}`,
+        `<i>Model: gemini-3.5-flash (Ema) · Assessed: ${formattedDate}</i>`
+      ].join('<br><br>');
 
-      await this.adapter.writeInherentFactor(
-        factor.sysId,
-        draft.score,
-        draft.rating,
+      const formattedJustification = this.formatForField(
         draft.justification,
-        comment,
-        auditTrail
+        'Risk__Risk_Assessment_Rating__c',
+        'Risk__Justification__c'
       );
-      results.push({ factor: factor.factorName, rating: draft.rating, score: draft.score, justification: draft.justification });
+      const verified = await writeVerified(tracer, `factor ${factor.factorName}`, () =>
+        this.adapter.writeInherentFactor(
+          factor.sysId,
+          draft.score,
+          draft.rating,
+          formattedJustification,
+          comment,
+          auditTrail
+        )
+      );
+      results.push({ factor: factor.factorName, rating: draft.rating, score: draft.score, justification: draft.justification, verified });
     }));
 
     // ── Instance-level narrative synthesis (inherent_justification) — duck-typed,
@@ -967,7 +1133,7 @@ export class InherentAssessmentAgent {
       // access only preserves `this` when invoked immediately as obj.method(...); once
       // stored in a variable and called standalone, `this` inside the adapter method
       // would otherwise be undefined.
-      await this.synthesizeInherentJustification(inst.sysId, results, rawWriteInherentSummary.bind(this.adapter));
+      await this.synthesizeInherentJustification(inst.sysId, results, rawWriteInherentSummary.bind(this.adapter), tracer);
     }
 
     // Optional platform-specific finalization step (e.g. Salesforce Risk
@@ -993,7 +1159,8 @@ export class InherentAssessmentAgent {
           results,
           html: tracer.renderHtml('InherentAssessmentAgent', inst.number || instanceSysId),
           riskSysId: inst.riskSysId,
-          assessmentNumber: inst.number
+          assessmentNumber: inst.number,
+          summary: buildAssessmentSummary('inherent factor(s)', results, outcome)
         });
       } catch (_) { /* observability is best-effort — never block the run */ }
     }
@@ -1237,7 +1404,8 @@ export class InherentAssessmentAgent {
   private async synthesizeInherentJustification(
     instanceSysId: string,
     results: any[],
-    writeInherentSummary: (instanceSysId: string, text: string) => Promise<void>
+    writeInherentSummary: (instanceSysId: string, text: string) => Promise<boolean>,
+    tracer: AgentTracer
   ): Promise<void> {
     const rated = results.filter(r => r.justification);
     if (rated.length === 0) return;
@@ -1294,7 +1462,7 @@ export class InherentAssessmentAgent {
     }
 
     if (summary) {
-      await writeInherentSummary(instanceSysId, summary);
+      await writeVerified(tracer, `instance ${instanceSysId} inherent_justification`, () => writeInherentSummary(instanceSysId, summary));
     }
   }
 }
@@ -1313,8 +1481,32 @@ export class RiskControlMappingAgent {
   private static readonly BATCH_SIZE = 40;
   private static readonly DESC_LIMIT = 250;
   private static readonly RISK_DESC_LIMIT = 600;
+  private terminology: { [key: string]: string } | null;
 
-  constructor(private adapter: BaseGRCAdapter, private llm: BaseLLMClient) { }
+  constructor(private adapter: BaseGRCAdapter, private llm: BaseLLMClient) {
+    this.terminology = this.adapter.getTerminology() || null;
+  }
+
+  private formatText(text: string, maxChars = 32768): string {
+    if (!text) return text;
+
+    let result = text;
+    if (this.terminology) {
+      for (const [from, to] of Object.entries(this.terminology)) {
+        const regex = new RegExp(`\\b${from}\\b`, 'gi');
+        result = result.replace(regex, (match) =>
+          match[0] === match[0].toUpperCase() ? to.charAt(0).toUpperCase() + to.slice(1) : to
+        );
+      }
+    }
+
+    if (result.length > maxChars) {
+      const truncated = result.substring(0, maxChars);
+      const lastSpace = truncated.lastIndexOf(' ');
+      return lastSpace > 0 ? truncated.substring(0, lastSpace) : truncated;
+    }
+    return result;
+  }
 
   async execute(riskSysId: string): Promise<{ success: boolean; message: string; details: any }> {
     const tracer = new AgentTracer();
@@ -1332,11 +1524,56 @@ export class RiskControlMappingAgent {
     const controls = await this.adapter.getControlsForEntity(risk.profileSysId || '');
     tracer.log('INFO', { controlCount: controls.length });
 
-    const result = controls.length === 0
-      ? await this.suggestNewControls(risk, entityLabel, tracer)
-      : controls.length <= RiskControlMappingAgent.BATCH_SIZE
-        ? await this.runSingleShot(risk, riskSysId, controls, entityLabel, tracer)
-        : await this.runChunked(risk, riskSysId, controls, entityLabel, tracer);
+    let result: { success: boolean; message: string; details: any };
+
+    if (controls.length === 0) {
+      result = await this.suggestNewControls(risk, entityLabel, tracer);
+    } else {
+      // ── Memory-reuse: skip controls already linked to this risk ──────────
+      // Duck-typed like the other agents' prior-assessment carry-forward — this
+      // one reads sn_risk_m2m_risk_control directly (the actual link table)
+      // rather than a fingerprinted response row, since risk-control mapping
+      // has no "assessment cycle" concept to fingerprint against. A control
+      // already linked needs neither a fresh LLM decision nor a fresh write
+      // (writing it again would create a duplicate link row).
+      const getExisting = (this.adapter as any).getExistingRiskControlMappings;
+      let alreadyMappedIds = new Set<string>();
+      if (typeof getExisting === 'function') {
+        const existing = await getExisting.call(this.adapter, riskSysId);
+        if (existing) alreadyMappedIds = existing;
+      }
+      const alreadyMapped = controls.filter(c => alreadyMappedIds.has(c.sysId));
+      const toEvaluate = controls.filter(c => !alreadyMappedIds.has(c.sysId));
+      tracer.log('INFO', { alreadyMappedCount: alreadyMapped.length, toEvaluateCount: toEvaluate.length });
+
+      if (toEvaluate.length === 0) {
+        result = this.finishAlreadyMapped(risk, entityLabel, controls.length, alreadyMapped);
+      } else {
+        const draft = toEvaluate.length <= RiskControlMappingAgent.BATCH_SIZE
+          ? await withRetry(() => this.mapControlsWithTools(risk, toEvaluate, alreadyMapped, entityLabel, tracer), 2)
+              .then(d => d ? { ...d, coverageNote: '' } : null)
+          : await this.runChunkedWithTools(risk, toEvaluate, alreadyMapped, entityLabel, tracer);
+
+        if (!draft) {
+          result = { success: false, message: 'AI evaluation failed for all control batches — please retry.', details: null };
+        } else {
+          // ── Self-critique — a second, independent reviewer pass over the fresh
+          // decisions only (already-mapped controls are ground truth, not a new
+          // AI decision, so there's nothing to critique there). ──
+          const critiqued = await this.critiqueMappingDecisions(risk, draft.matches, draft.rejected, tracer);
+
+          const carriedMatches: ResolvedControl[] = alreadyMapped.map(c => ({
+            sysId: c.sysId, name: c.name, category: c.category || 'General',
+            reason: 'Already mapped to this risk from a previous run — no changes needed.'
+          }));
+          const allMatches = this.dedupeBySysId([...carriedMatches, ...critiqued.matches]);
+
+          result = allMatches.length === 0
+            ? this.finishNoMatch(risk, entityLabel, controls.length, critiqued.rejected, draft.justification, draft.gaps, draft.recommendation, draft.coverageNote)
+            : await this.finishMatched(risk, riskSysId, entityLabel, controls.length, allMatches, critiqued.matches, critiqued.rejected, draft.justification, draft.gaps, draft.recommendation, tracer, draft.coverageNote);
+        }
+      }
+    }
 
     // Optional instance-level narrative (ServiceNow's advanced risk module
     // carries a single u_ai_recommendation-style field directly on the risk
@@ -1346,7 +1583,9 @@ export class RiskControlMappingAgent {
     // it AND execute() actually produced a narrative to write.
     const rawWriteSummary = (this.adapter as any).writeRiskMappingSummary;
     if (typeof rawWriteSummary === 'function' && result.details?.narrative) {
-      await rawWriteSummary.call(this.adapter, riskSysId, result.details.narrative);
+      await writeVerified(tracer, `risk ${riskSysId} u_ai_recommendation`, () =>
+        rawWriteSummary.call(this.adapter, riskSysId, result.details.narrative)
+      );
     }
 
     // ── Observability: write a trace record to u_ema_audit_trail if adapter supports it ──
@@ -1361,7 +1600,8 @@ export class RiskControlMappingAgent {
           targetId: riskSysId,
           outcome,
           results: result.details,
-          html: tracer.renderHtml('RiskControlMappingAgent', risk.name || riskSysId)
+          html: tracer.renderHtml('RiskControlMappingAgent', risk.name || riskSysId),
+          summary: result.message
         });
       } catch (_) { /* observability is best-effort — never block the run */ }
     }
@@ -1409,13 +1649,107 @@ export class RiskControlMappingAgent {
     return matches.filter(m => (seen.has(m.sysId) ? false : (seen.add(m.sysId), true)));
   }
 
-  // ── Single-shot path (control pool fits in one prompt) ───────────────────
-  private async runSingleShot(risk: Risk, riskSysId: string, controls: Control[], entityLabel: string, tracer: AgentTracer) {
-    const prompt = [
-      this.riskBlock(risk, entityLabel),
+  /** Context block for controls already linked to this risk — informational only, never re-decided. */
+  private alreadyMappedBlock(alreadyMapped: Control[]): string {
+    if (alreadyMapped.length === 0) return '';
+    return [
       '',
-      `CANDIDATE CONTROLS (${controls.length} total from this ${entityLabel}):`,
-      this.controlListBlock(controls),
+      'ALREADY MAPPED (context only — already linked to this risk from a previous run, do NOT re-decide these,',
+      'but factor them into your gap analysis):',
+      alreadyMapped.map(c => `- ${c.name}`).join('\n')
+    ].join('\n');
+  }
+
+  // Tool declarations + executor shared by every mapping-decision call (single-shot
+  // and each chunked batch). The model starts with only a compact, truncated list —
+  // full risk/control text and entity issue data sit behind tools it must choose to
+  // call, same investigate-before-concluding pattern as the other two agents.
+  private buildMappingTools(risk: Risk, pool: Control[], entityLabel: string): { tools: ToolDeclaration[]; executeTool: (name: string, args: any) => Promise<any> } {
+    const tools: ToolDeclaration[] = [
+      {
+        name: 'get_risk_full_description',
+        description: "Get this risk's full, untruncated description (the description shown above may be truncated).",
+        parameters: { type: 'OBJECT', properties: {} }
+      },
+      {
+        name: 'get_control_full_description',
+        description: 'Get the full, untruncated name and description for one candidate control by its index number shown in the list above (descriptions there may be truncated).',
+        parameters: { type: 'OBJECT', properties: { index: { type: 'INTEGER' } }, required: ['index'] }
+      },
+      {
+        name: 'get_entity_open_issues',
+        description: `Get currently open issues recorded against this ${entityLabel.toLowerCase()} — real-world evidence of what is currently going wrong, useful context for whether a candidate control is actually addressing live problems.`,
+        parameters: { type: 'OBJECT', properties: {} }
+      }
+    ];
+
+    const executeTool = async (name: string, args: any): Promise<any> => {
+      switch (name) {
+        case 'get_risk_full_description':
+          return { description: risk.description || 'No description provided.' };
+        case 'get_control_full_description': {
+          const ctrl = pool[(args?.index || 0) - 1];
+          if (!ctrl) return { error: 'Invalid index' };
+          return { name: ctrl.name, category: ctrl.category || 'General', description: ctrl.description || 'No description provided.' };
+        }
+        case 'get_entity_open_issues': {
+          const issues = await this.adapter.getEntityIssues(risk.profileSysId || '');
+          return { issues: issues.map(i => ({ number: i.number, desc: i.desc, state: i.state, priority: i.priority })), count: issues.length };
+        }
+        default:
+          return { error: `Unknown tool: ${name}` };
+      }
+    };
+
+    return { tools, executeTool };
+  }
+
+  // ── Single-shot path (control pool fits in one prompt) ───────────────────
+  // Deliberately kept as ONE call over the whole list rather than one tool-loop
+  // per control (unlike the other two agents' per-item pattern): this is a SET
+  // classification task, not a per-item rating, and seeing every candidate
+  // together is what lets the model reason comparatively ("this one is clearly
+  // the better fit, that one is redundant with an already-mapped control").
+  // Tool-calling is layered on top of that same list-classification shape —
+  // full risk/control text and entity issues sit behind tools instead of being
+  // dumped inline — rather than replacing it.
+  private async mapControlsWithTools(
+    risk: Risk, pool: Control[], alreadyMapped: Control[], entityLabel: string, tracer: AgentTracer
+  ): Promise<{ matches: ResolvedControl[]; rejected: ResolvedControl[]; justification: string; gaps: string; recommendation: string } | null> {
+    const { tools, executeTool } = this.buildMappingTools(risk, pool, entityLabel);
+
+    const schema = {
+      type: 'OBJECT',
+      properties: {
+        matches: {
+          type: 'ARRAY',
+          description: 'Controls that SHOULD be mapped — they address this risk.',
+          items: { type: 'OBJECT', properties: { index: { type: 'INTEGER' }, reason: { type: 'STRING', description: 'Why this control mitigates the risk' } }, required: ['index', 'reason'] }
+        },
+        rejected: {
+          type: 'ARRAY',
+          description: 'Controls that should NOT be mapped — they do not meet business criteria for this risk.',
+          items: { type: 'OBJECT', properties: { index: { type: 'INTEGER' }, reason: { type: 'STRING', description: 'Why this control does NOT mitigate the risk' } }, required: ['index', 'reason'] }
+        },
+        overall_justification: { type: 'STRING' },
+        gaps: { type: 'STRING' },
+        recommendation: { type: 'STRING', description: 'Only meaningful if gaps exist; empty string otherwise' }
+      },
+      required: ['matches', 'rejected', 'overall_justification', 'gaps']
+    };
+    tools.push({ name: 'submit_mapping', description: 'Finalize your control-mapping decision once you have gathered enough evidence.', parameters: schema });
+
+    const initialPrompt = [
+      this.riskBlock(risk, entityLabel),
+      '(Description above may be truncated — call get_risk_full_description for the complete text.)',
+      this.alreadyMappedBlock(alreadyMapped),
+      '',
+      `CANDIDATE CONTROLS (${pool.length} total from this ${entityLabel}, not yet decided):`,
+      this.controlListBlock(pool),
+      '(Descriptions above may be truncated — call get_control_full_description(index) for the complete text on any control.)',
+      '',
+      'You may also call get_entity_open_issues for real-world evidence of what is currently going wrong for this',
+      `${entityLabel.toLowerCase()} — useful context for whether a candidate control actually addresses live problems.`,
       '',
       'TASK:',
       '1. Select controls that GENUINELY mitigate this specific risk — be selective, do not force',
@@ -1423,121 +1757,130 @@ export class RiskControlMappingAgent {
       '   is a valid answer.',
       '2. For EVERY control NOT selected, provide a concise rejection reason explaining why it does',
       '   NOT meet the business criteria for this risk.',
-      '3. Provide overall justification, gaps (what this risk is NOT covered for), and — only if',
-      '   gaps exist — specific recommendations for new controls to create.'
+      '3. Provide overall justification, gaps (what this risk is NOT covered for — considering the',
+      '   already-mapped controls listed above too, not just what you just evaluated), and — only if',
+      '   gaps exist — specific recommendations for new controls to create.',
+      '',
+      'Use the available tools for anything you need beyond what is shown above, then call submit_mapping',
+      'with your final decision.'
     ].join('\n');
 
-    const systemInstruction = 'You are a GRC Compliance mapping architect. Analyze risks and select mapping control indexes. For every rejected control, explain why it does not address the business criteria of this specific risk.';
+    const systemInstruction = 'You are Ema, a GRC Compliance mapping architect. You investigate before you conclude: pull whatever additional evidence you judge necessary via the available tools, then finalize by calling submit_mapping. For every rejected control, explain why it does not address the business criteria of this specific risk.';
 
-    const schema = {
-      type: 'OBJECT',
-      properties: {
-        match: { type: 'BOOLEAN' },
-        matches: {
-          type: 'ARRAY',
-          description: 'Controls that SHOULD be mapped — they address this risk.',
-          items: {
-            type: 'OBJECT',
-            properties: {
-              index: { type: 'INTEGER' },
-              reason: { type: 'STRING', description: 'Why this control mitigates the risk' }
-            },
-            required: ['index', 'reason']
-          }
-        },
-        rejected: {
-          type: 'ARRAY',
-          description: 'Controls that should NOT be mapped — they do not meet business criteria for this risk.',
-          items: {
-            type: 'OBJECT',
-            properties: {
-              index: { type: 'INTEGER' },
-              reason: { type: 'STRING', description: 'Why this control does NOT mitigate the risk' }
-            },
-            required: ['index', 'reason']
-          }
-        },
-        overall_justification: { type: 'STRING' },
-        gaps: { type: 'STRING' },
-        recommendation: { type: 'STRING', description: 'Only meaningful if gaps exist; empty string otherwise' }
-      },
-      required: ['match', 'matches', 'rejected', 'overall_justification', 'gaps']
-    };
+    tracer.log('REQUEST', { path: 'singleShot', prompt_preview: initialPrompt });
 
-    tracer.log('REQUEST', { path: 'singleShot', prompt_preview: prompt });
+    const loop = await this.llm.runToolLoop<{
+      matches: Array<{ index: number; reason: string }>;
+      rejected: Array<{ index: number; reason: string }>;
+      overall_justification: string;
+      gaps: string;
+      recommendation?: string;
+    }>(systemInstruction, initialPrompt, tools, 'submit_mapping', executeTool, 6);
 
-    const response = await this.llm.generateStructuredOutput<MappingResult>(prompt, systemInstruction, schema);
-
-    tracer.log('RESPONSE', { path: 'singleShot', matchesCount: response.matches?.length || 0, rejectedCount: response.rejected?.length || 0 });
-
-    const resolvedMatches = this.dedupeBySysId(this.resolveAgainst(response.matches, controls));
-    const resolvedRejected = [
-      ...this.resolveAgainst(response.rejected, controls),
-      ...this.unmentionedRejections(controls, response.matches, response.rejected || [])
-    ];
-
-    if (!response.match || resolvedMatches.length === 0) {
-      return this.finishNoMatch(risk, entityLabel, controls.length, resolvedRejected, response.overall_justification, response.gaps, response.recommendation || '');
+    if (!loop) {
+      tracer.log('ERROR', { path: 'singleShot', error: 'tool loop did not finalize' });
+      return null;
     }
 
-    return this.finishMatched(risk, riskSysId, entityLabel, controls.length, resolvedMatches, resolvedRejected, response.overall_justification, response.gaps, response.recommendation || '');
+    tracer.log('RESPONSE', { path: 'singleShot', matchesCount: loop.result.matches?.length || 0, rejectedCount: loop.result.rejected?.length || 0 });
+
+    return {
+      matches: this.dedupeBySysId(this.resolveAgainst(loop.result.matches, pool)),
+      rejected: [
+        ...this.resolveAgainst(loop.result.rejected, pool),
+        ...this.unmentionedRejections(pool, loop.result.matches, loop.result.rejected || [])
+      ],
+      justification: loop.result.overall_justification || '',
+      gaps: loop.result.gaps || '',
+      recommendation: loop.result.recommendation || ''
+    };
+  }
+
+  // ── One chunked batch (matches/rejected only — no gap analysis, other batches exist it can't see) ──
+  private async mapControlsBatchWithTools(
+    risk: Risk, chunk: Control[], alreadyMapped: Control[], entityLabel: string, chunkIndex: number, chunksTotal: number, tracer: AgentTracer
+  ): Promise<{ matches: ResolvedControl[]; rejected: ResolvedControl[] } | null> {
+    const { tools, executeTool } = this.buildMappingTools(risk, chunk, entityLabel);
+
+    const batchSchema = {
+      type: 'OBJECT',
+      properties: {
+        matches: { type: 'ARRAY', items: { type: 'OBJECT', properties: { index: { type: 'INTEGER' }, reason: { type: 'STRING' } }, required: ['index', 'reason'] } },
+        rejected: { type: 'ARRAY', items: { type: 'OBJECT', properties: { index: { type: 'INTEGER' }, reason: { type: 'STRING' } }, required: ['index', 'reason'] } }
+      },
+      required: ['matches', 'rejected']
+    };
+    tools.push({ name: 'submit_mapping', description: 'Finalize your control-mapping decision for this batch.', parameters: batchSchema });
+
+    const initialPrompt = [
+      this.riskBlock(risk, entityLabel),
+      '(Description above may be truncated — call get_risk_full_description for the complete text.)',
+      this.alreadyMappedBlock(alreadyMapped),
+      '',
+      `CANDIDATE CONTROLS — batch ${chunkIndex} of ${chunksTotal} (reference ONLY by the index number below, not yet decided):`,
+      this.controlListBlock(chunk),
+      '(Descriptions above may be truncated — call get_control_full_description(index) for the complete text.)',
+      '',
+      'You may also call get_entity_open_issues for real-world evidence of what is currently going wrong.',
+      '',
+      'TASK: From THIS BATCH ONLY, select controls that genuinely mitigate this risk (be selective,',
+      'an empty list is valid) and give every non-selected control a rejection reason. Do NOT provide',
+      'gap analysis or an overall justification — other batches exist that you cannot see here.',
+      '',
+      'Use the available tools for anything you need, then call submit_mapping with your decision for this batch.'
+    ].join('\n');
+
+    const systemInstruction = 'You are Ema, a GRC Compliance mapping architect reviewing one batch of a larger control library against a single risk. Investigate via the available tools before you conclude.';
+
+    tracer.log('REQUEST', { path: 'chunked_batch', batchIndex: chunkIndex, prompt_preview: initialPrompt });
+
+    const loop = await this.llm.runToolLoop<{ matches: Array<{ index: number; reason: string }>; rejected: Array<{ index: number; reason: string }> }>(
+      systemInstruction, initialPrompt, tools, 'submit_mapping', executeTool, 6
+    );
+
+    if (!loop) {
+      tracer.log('ERROR', { path: 'chunked_batch', batchIndex: chunkIndex, error: 'tool loop did not finalize' });
+      return null;
+    }
+
+    tracer.log('RESPONSE', { path: 'chunked_batch', batchIndex: chunkIndex, matchesCount: loop.result.matches?.length || 0, rejectedCount: loop.result.rejected?.length || 0 });
+
+    return {
+      matches: this.resolveAgainst(loop.result.matches, chunk),
+      rejected: [...this.resolveAgainst(loop.result.rejected, chunk), ...this.unmentionedRejections(chunk, loop.result.matches, loop.result.rejected || [])]
+    };
   }
 
   // ── Chunked path (control pool too large for one prompt) ─────────────────
-  private async runChunked(risk: Risk, riskSysId: string, controls: Control[], entityLabel: string, tracer: AgentTracer) {
+  // Batches run concurrently (same batchSize=5 concurrency convention used by
+  // the other two agents' main loops) rather than sequentially — independent,
+  // non-overlapping control chunks against the same risk have no reason to
+  // wait on each other.
+  private async runChunkedWithTools(
+    risk: Risk, controls: Control[], alreadyMapped: Control[], entityLabel: string, tracer: AgentTracer
+  ): Promise<{ matches: ResolvedControl[]; rejected: ResolvedControl[]; justification: string; gaps: string; recommendation: string; coverageNote: string } | null> {
     const batchSize = RiskControlMappingAgent.BATCH_SIZE;
     const chunksTotal = Math.ceil(controls.length / batchSize);
-    let chunksOk = 0;
+    const indexedChunks: Array<{ chunk: Control[]; index: number }> = [];
+    for (let i = 0; i < controls.length; i += batchSize) {
+      indexedChunks.push({ chunk: controls.slice(i, i + batchSize), index: indexedChunks.length + 1 });
+    }
+
+    const batchResults = await runInParallelBatches(indexedChunks, 5, async ({ chunk, index }) =>
+      withRetry(() => this.mapControlsBatchWithTools(risk, chunk, alreadyMapped, entityLabel, index, chunksTotal, tracer), 2)
+    );
+
     let allMatches: ResolvedControl[] = [];
     let allRejected: ResolvedControl[] = [];
-
-    for (let i = 0; i < controls.length; i += batchSize) {
-      const chunkIndex = Math.floor(i / batchSize) + 1;
-      const chunk = controls.slice(i, i + batchSize);
-
-      const prompt = [
-        this.riskBlock(risk, entityLabel),
-        '',
-        `CANDIDATE CONTROLS — batch ${chunkIndex} of ${chunksTotal} (reference ONLY by the index number below):`,
-        this.controlListBlock(chunk),
-        '',
-        'TASK: From THIS BATCH ONLY, select controls that genuinely mitigate this risk (be selective,',
-        'an empty list is valid) and give every non-selected control a rejection reason. Do NOT provide',
-        'gap analysis or an overall justification — other batches exist that you cannot see here.'
-      ].join('\n');
-
-      const systemInstruction = 'You are a GRC Compliance mapping architect reviewing one batch of a larger control library against a single risk.';
-      const schema = {
-        type: 'OBJECT',
-        properties: {
-          matches: {
-            type: 'ARRAY',
-            items: { type: 'OBJECT', properties: { index: { type: 'INTEGER' }, reason: { type: 'STRING' } }, required: ['index', 'reason'] }
-          },
-          rejected: {
-            type: 'ARRAY',
-            items: { type: 'OBJECT', properties: { index: { type: 'INTEGER' }, reason: { type: 'STRING' } }, required: ['index', 'reason'] }
-          }
-        },
-        required: ['matches', 'rejected']
-      };
-
-      try {
-        tracer.log('REQUEST', { path: 'chunked_batch', batchIndex: chunkIndex, prompt_preview: prompt });
-        const response = await this.llm.generateStructuredOutput<{ matches: Array<{ index: number; reason: string }>; rejected: Array<{ index: number; reason: string }> }>(prompt, systemInstruction, schema);
-        tracer.log('RESPONSE', { path: 'chunked_batch', batchIndex: chunkIndex, matchesCount: response.matches?.length || 0, rejectedCount: response.rejected?.length || 0 });
-        chunksOk++;
-        allMatches.push(...this.resolveAgainst(response.matches, chunk));
-        allRejected.push(...this.resolveAgainst(response.rejected, chunk), ...this.unmentionedRejections(chunk, response.matches, response.rejected || []));
-      } catch (e: any) {
-        // One failed batch shouldn't sink the whole run — proceed with whatever other batches produced.
-        tracer.log('ERROR', { path: 'chunked_batch', batchIndex: chunkIndex, error: e.message });
-      }
+    let chunksOk = 0;
+    for (const res of batchResults) {
+      if (!res) continue;
+      chunksOk++;
+      allMatches.push(...res.matches);
+      allRejected.push(...res.rejected);
     }
 
-    if (chunksOk === 0) {
-      return { success: false, message: 'AI evaluation failed for all control batches — please retry.', details: null };
-    }
+    if (chunksOk === 0) return null;
 
     allMatches = this.dedupeBySysId(allMatches);
     const coverageNote = chunksOk < chunksTotal
@@ -1545,18 +1888,21 @@ export class RiskControlMappingAgent {
       : '';
 
     // Consolidation call: one combined justification/gaps/recommendation over
-    // the matches gathered across all batches, since no single batch prompt
-    // saw the full picture.
+    // the matches gathered across all batches (plus already-mapped controls),
+    // since no single batch prompt saw the full picture. Plain structured call,
+    // not tool-calling — it only needs to synthesize the resolved match list
+    // it's handed, nothing left to investigate.
     let justification = '', gaps = '', recommendation = '';
     try {
-      const matchedList = allMatches.length === 0
-        ? '(none — no existing control matched)'
-        : allMatches.map(m => `- ${m.name} (${m.reason})`).join('\n');
+      const matchedList = [
+        ...alreadyMapped.map(c => `- ${c.name} (already mapped from a previous run)`),
+        ...allMatches.map(m => `- ${m.name} (${m.reason})`)
+      ];
       const consPrompt = [
         this.riskBlock(risk, entityLabel),
         '',
-        'MATCHED CONTROLS (selected across all batches):',
-        matchedList,
+        'MATCHED CONTROLS (selected across all batches, plus any already mapped from before):',
+        matchedList.length > 0 ? matchedList.join('\n') : '(none — no existing control matched)',
         '',
         'TASK:',
         '1. overall_justification: 2-3 sentences on the common theme across matched controls',
@@ -1582,11 +1928,134 @@ export class RiskControlMappingAgent {
       tracer.log('ERROR', { path: 'consolidation', error: e.message });
     }
 
-    if (allMatches.length === 0) {
-      return this.finishNoMatch(risk, entityLabel, controls.length, allRejected, justification, gaps, recommendation, coverageNote);
+    return { matches: allMatches, rejected: allRejected, justification, gaps, recommendation, coverageNote };
+  }
+
+  // ── Pass 2: self-critique ────────────────────────────────────────────────
+  // Second, independent reviewer pass over the fresh match/reject decisions —
+  // same framing as the other two agents' critique passes: told what the first
+  // pass concluded, asked to find fault with it specifically. Can flip a
+  // match to a rejection or vice versa; a failed/unparseable review chunk
+  // leaves its decisions exactly as the first pass produced them.
+  private async critiqueMappingDecisions(
+    risk: Risk, matches: ResolvedControl[], rejected: ResolvedControl[], tracer: AgentTracer
+  ): Promise<{ matches: ResolvedControl[]; rejected: ResolvedControl[] }> {
+    type Decision = ResolvedControl & { decision: 'match' | 'reject' };
+    const allDecisions: Decision[] = [
+      ...matches.map(m => ({ ...m, decision: 'match' as const })),
+      ...rejected.map(r => ({ ...r, decision: 'reject' as const }))
+    ];
+    if (allDecisions.length === 0) return { matches, rejected };
+
+    const critiqueChunkSize = 8;
+    const chunks: Decision[][] = [];
+    for (let i = 0; i < allDecisions.length; i += critiqueChunkSize) {
+      chunks.push(allDecisions.slice(i, i + critiqueChunkSize));
     }
 
-    return this.finishMatched(risk, riskSysId, entityLabel, controls.length, allMatches, allRejected, justification, gaps, recommendation, coverageNote);
+    const flips = new Map<string, { decision: 'match' | 'reject'; note: string }>();
+
+    await Promise.all(chunks.map(async chunk => {
+      const blocks = chunk.map((d, idx) =>
+        `[${idx + 1}] CONTROL: ${d.name} (${d.category})\n    CURRENT DECISION: ${d.decision === 'match' ? 'MAPPED' : 'REJECTED'}\n    REASON: ${d.reason}`
+      ).join('\n\n');
+
+      const prompt = [
+        'You are Ema, now reviewing your own draft risk-control mapping decisions as a second, independent pass.',
+        'For each control below, a first pass already decided whether it maps to this risk and why.',
+        'Check whether that decision actually follows from the risk and control shown — not whether you would',
+        'phrase it differently.',
+        '',
+        `RISK: ${risk.name}`,
+        `Description: ${(risk.description || 'No description provided.').substring(0, RiskControlMappingAgent.RISK_DESC_LIMIT)}`,
+        '',
+        blocks,
+        '',
+        'For each control: if the decision is well-supported, respond action="confirm". If it is not — a mapped',
+        'control doesn\'t actually address this specific risk, or a rejected control actually does — respond',
+        'action="flip" and explain in "note" specifically what the first pass got wrong.',
+        '',
+        'Respond ONLY with valid JSON, no markdown:',
+        '{"reviews": [{"index": 1, "action": "confirm", "note": ""}, ...]}'
+      ].join('\n');
+
+      const schema = {
+        type: 'OBJECT',
+        properties: {
+          reviews: {
+            type: 'ARRAY',
+            items: {
+              type: 'OBJECT',
+              properties: { index: { type: 'INTEGER' }, action: { type: 'STRING' }, note: { type: 'STRING' } },
+              required: ['index', 'action']
+            }
+          }
+        },
+        required: ['reviews']
+      };
+
+      tracer.log('REQUEST', { phase: 'critique', prompt_preview: prompt });
+
+      try {
+        const response = await this.llm.generateStructuredOutput<{ reviews: Array<{ index: number; action: string; note?: string }> }>(
+          prompt, 'You are Ema, acting as an independent second reviewer of draft risk-control mapping decisions.', schema
+        );
+        tracer.log('RESPONSE', { phase: 'critique', status: 'completed', reviews: response.reviews });
+        for (const review of response.reviews || []) {
+          const d = chunk[review.index - 1];
+          if (!d || review.action !== 'flip') continue;
+          flips.set(d.sysId, { decision: d.decision === 'match' ? 'reject' : 'match', note: review.note || 'decision did not hold up against the risk on review.' });
+        }
+      } catch (e: any) {
+        // Critique is an enrichment pass — a failed or unparseable review leaves
+        // this chunk's decisions exactly as the first pass produced them.
+        tracer.log('ERROR', { phase: 'critique', error: e.message });
+      }
+    }));
+
+    if (flips.size === 0) return { matches, rejected };
+
+    const annotate = (r: ResolvedControl, note: string): ResolvedControl => ({ ...r, reason: `${r.reason}\n\n🔁 Revised on second-pass review: ${note}` });
+
+    const finalMatches = [
+      ...matches.filter(m => !flips.has(m.sysId)),
+      ...rejected.filter(r => flips.get(r.sysId)?.decision === 'match').map(r => annotate(r, flips.get(r.sysId)!.note))
+    ];
+    const finalRejected = [
+      ...rejected.filter(r => !flips.has(r.sysId)),
+      ...matches.filter(m => flips.get(m.sysId)?.decision === 'reject').map(m => annotate(m, flips.get(m.sysId)!.note))
+    ];
+
+    return { matches: finalMatches, rejected: finalRejected };
+  }
+
+  // ── Every candidate control already linked to this risk — no LLM call needed ──
+  private finishAlreadyMapped(risk: Risk, entityLabel: string, totalControls: number, alreadyMapped: Control[]) {
+    const matches: ResolvedControl[] = alreadyMapped.map(c => ({
+      sysId: c.sysId, name: c.name, category: c.category || 'General',
+      reason: 'Already mapped to this risk from a previous run — no changes needed.'
+    }));
+
+    const narrative = [
+      `${htmlLabel('SUMMARY:')} All ${alreadyMapped.length} candidate control(s) for this ${htmlEscape(entityLabel.toLowerCase())} are already mapped to this risk from a previous run.`,
+      `No new controls to evaluate — nothing was re-decided or re-written.`
+    ].join('<br><br>');
+
+    return {
+      success: true,
+      message: `All ${alreadyMapped.length} control(s) already mapped — nothing new to evaluate.`,
+      details: {
+        entityLabel,
+        entityName: risk.profileName,
+        totalControlsEvaluated: totalControls,
+        matches,
+        rejected: [],
+        justification: 'All candidate controls were already mapped to this risk from a previous run.',
+        gaps: '',
+        recommendations: '',
+        narrative
+      }
+    };
   }
 
   // ── No controls exist for this entity at all ──────────────────────────────
@@ -1624,14 +2093,10 @@ export class RiskControlMappingAgent {
     tracer.log('RESPONSE', { path: 'suggestNewControls', suggestionsCount: suggestions.length });
 
     const narrative = [
-      `No controls exist for ${entityLabel.toLowerCase()} "${risk.profileName}".`,
-      '',
-      'Suggested controls to create:',
-      ...suggestions.map(c => `- ${c.name}: ${c.description}`),
-      '',
-      'Why these controls:',
-      response.explanation || 'Not provided'
-    ].join('\n');
+      `${htmlLabel('SUMMARY:')} No controls exist for ${htmlEscape(entityLabel.toLowerCase())} "${htmlEscape(risk.profileName)}".`,
+      `${htmlLabel('SUGGESTED CONTROLS TO CREATE:')}<br>${suggestions.map(c => htmlChoiceLine(c.name, c.description, true)).join('<br>')}`,
+      `${htmlLabel('WHY THESE CONTROLS:')}<br>${htmlEscape(response.explanation || 'Not provided')}`
+    ].join('<br><br>');
 
     return {
       success: true,
@@ -1651,35 +2116,46 @@ export class RiskControlMappingAgent {
 
   private async finishMatched(
     risk: Risk, riskSysId: string, entityLabel: string, totalControls: number,
-    matches: ResolvedControl[], rejected: ResolvedControl[],
-    justification: string, gaps: string, recommendation: string, coverageNote: string = ''
+    allMatches: ResolvedControl[], newMatchesToWrite: ResolvedControl[], rejected: ResolvedControl[],
+    justification: string, gaps: string, recommendation: string, tracer: AgentTracer, coverageNote: string = ''
   ) {
-    await this.adapter.writeRiskControlMapping(riskSysId, matches, justification, gaps, recommendation);
+    // Only write the NEW links — already-mapped controls already have a row in
+    // sn_risk_m2m_risk_control, and the live write path has no idempotency
+    // check, so re-sending them would create duplicate link rows.
+    const verified = newMatchesToWrite.length > 0
+      ? await writeVerified(tracer, `risk-control mapping for ${riskSysId}`, () =>
+          this.adapter.writeRiskControlMapping(
+            riskSysId,
+            newMatchesToWrite,
+            this.formatText(justification),
+            this.formatText(gaps),
+            this.formatText(recommendation)
+          )
+        )
+      : true;
 
+    const carriedCount = allMatches.length - newMatchesToWrite.length;
     const narrative = [
-      `Mapped ${matches.length} control(s) to this risk.`,
-      '',
-      'Why these controls:',
-      justification || 'Not provided',
-      '',
-      'Gaps — areas not covered by existing controls:',
-      gaps || 'None identified',
-      ...(coverageNote ? ['', coverageNote] : [])
-    ].join('\n');
+      `${htmlLabel('SUMMARY:')} Mapped ${allMatches.length} control(s) to this risk${carriedCount > 0 ? ` (${carriedCount} already mapped from a previous run, ${newMatchesToWrite.length} newly added)` : ''}. Rejected ${rejected.length} control(s).`,
+      `${htmlLabel('RATIONALE — why these were picked and why others were rejected:')}<br>${htmlEscape(justification || 'Not provided')}`,
+      `${htmlLabel('GAPS — areas not covered by existing controls:')}<br>${htmlEscape(gaps || 'None identified')}`,
+      ...(coverageNote ? [htmlEscape(coverageNote)] : [])
+    ].join('<br><br>');
 
     return {
       success: true,
-      message: `Mapped ${matches.length} control(s) to risk. Rejected ${rejected.length} control(s).`,
+      message: `Mapped ${allMatches.length} control(s) to risk (${newMatchesToWrite.length} new). Rejected ${rejected.length} control(s).`,
       details: {
         entityLabel,
         entityName: risk.profileName,
         totalControlsEvaluated: totalControls,
-        matches,
+        matches: allMatches,
         rejected,
         justification,
         gaps,
         recommendations: recommendation,
-        narrative
+        narrative,
+        verified
       }
     };
   }
@@ -1689,16 +2165,12 @@ export class RiskControlMappingAgent {
     justification: string, gaps: string, recommendation: string, coverageNote: string = ''
   ) {
     const narrative = [
-      `Reviewed ${totalControls} control(s) and found none that genuinely mitigate this risk.`,
-      '',
-      'Why:',
-      justification || 'Not provided',
-      '',
-      'Gaps:',
-      gaps || 'Not provided',
-      ...(recommendation ? ['', 'Recommended controls to create:', recommendation] : []),
-      ...(coverageNote ? ['', coverageNote] : [])
-    ].join('\n');
+      `${htmlLabel('SUMMARY:')} Reviewed ${totalControls} control(s) and found none that genuinely mitigate this risk.`,
+      `${htmlLabel('RATIONALE — why each was rejected:')}<br>${htmlEscape(justification || 'Not provided')}`,
+      `${htmlLabel('GAPS:')}<br>${htmlEscape(gaps || 'Not provided')}`,
+      ...(recommendation ? [`${htmlLabel('RECOMMENDED CONTROLS TO CREATE:')}<br>${htmlEscape(recommendation)}`] : []),
+      ...(coverageNote ? [htmlEscape(coverageNote)] : [])
+    ].join('<br><br>');
 
     return {
       success: true,
@@ -1716,6 +2188,404 @@ export class RiskControlMappingAgent {
       }
     };
   }
+}
+
+// ============================================================================
+// 4. Issue Identification and Creation Agent
+// ============================================================================
+// Scan-triggered (sn_risk_risk.state moving to Monitor), not chained after
+// another agent's write and not a user-click action — none of the three
+// assessment agents above ever touch a risk's state field, so a periodic
+// scan (see findRisksNeedingIssueReview) is the only viable trigger, not just
+// the safer one. Drafts ONE sn_grc_issue per qualifying risk from context the
+// platform has already computed (residual rating, approver) — it does not
+// repeat the CRA agents' own evidence-gathering, so its tool-calling shape is
+// deliberately lighter (2 tools, not 3-4; maxTurns 4, not 6) while still
+// holding to the same standards: an investigate-before-concluding tool loop,
+// a second self-critique pass with authority to revise, and the same
+// writeObservabilityTrace audit trail the CRA agents write to.
+export class IssueIdentificationAgent {
+  private terminology: { [key: string]: string } | null;
+
+  constructor(private adapter: BaseGRCAdapter, private llm: BaseLLMClient) {
+    this.terminology = this.adapter.getTerminology() || null;
+  }
+
+  private formatText(text: string, maxChars = 32768): string {
+    if (!text) return text;
+
+    let result = text;
+    if (this.terminology) {
+      for (const [from, to] of Object.entries(this.terminology)) {
+        const regex = new RegExp(`\\b${from}\\b`, 'gi');
+        result = result.replace(regex, (match) =>
+          match[0] === match[0].toUpperCase() ? to.charAt(0).toUpperCase() + to.slice(1) : to
+        );
+      }
+    }
+
+    if (result.length > maxChars) {
+      const truncated = result.substring(0, maxChars);
+      const lastSpace = truncated.lastIndexOf(' ');
+      return lastSpace > 0 ? truncated.substring(0, lastSpace) : truncated;
+    }
+    return result;
+  }
+
+  // Takes just the risk — same single-targetId convention as the other three
+  // agents in /api/run-agent. When and why to call this is decided entirely
+  // outside this backend (a ServiceNow client script), so the assessment
+  // instance is resolved and duplicate-checked here rather than handed in.
+  async execute(riskSysId: string): Promise<{ success: boolean; message: string; details: any }> {
+    const tracer = new AgentTracer();
+    tracer.log('START', { riskSysId });
+
+    const risk = await this.adapter.getRisk(riskSysId);
+    if (!risk) {
+      tracer.log('ERROR', { error: 'Risk not found' });
+      return { success: false, message: 'Risk not found', details: null };
+    }
+
+    const resolveInstance = (this.adapter as any).resolveLatestAssessmentInstance;
+    const hasExisting = (this.adapter as any).hasExistingIssueForAssessment;
+    const getContext = (this.adapter as any).getIssueDraftContext;
+    const getRatingOptions = (this.adapter as any).getIssueRatingOptions;
+    const createIssue = (this.adapter as any).createRiskIssue;
+    if (typeof resolveInstance !== 'function' || typeof hasExisting !== 'function' ||
+        typeof getContext !== 'function' || typeof getRatingOptions !== 'function' || typeof createIssue !== 'function') {
+      tracer.log('ERROR', { error: 'Adapter does not support issue drafting' });
+      return { success: false, message: 'This platform does not support issue drafting.', details: null };
+    }
+
+    const assessmentInstanceSysId = await resolveInstance.call(this.adapter, riskSysId);
+    if (!assessmentInstanceSysId) {
+      tracer.log('ERROR', { error: 'No assessment instance found for this risk' });
+      return { success: false, message: 'No assessment instance found for this risk — cannot draft an issue without assessment context.', details: null };
+    }
+
+    const alreadyExists = await hasExisting.call(this.adapter, assessmentInstanceSysId);
+    if (alreadyExists === null) {
+      tracer.log('ERROR', { error: 'Could not verify whether an issue already exists' });
+      return { success: false, message: 'Could not verify whether an issue already exists for this assessment — skipping to avoid a duplicate.', details: null };
+    }
+    if (alreadyExists) {
+      tracer.log('END', { outcome: 'already_exists' });
+      return { success: true, message: 'An issue already exists for this risk assessment — no action taken.', details: { alreadyExists: true } };
+    }
+
+    const [context, ratingOptions] = await Promise.all([
+      getContext.call(this.adapter, assessmentInstanceSysId),
+      getRatingOptions.call(this.adapter)
+    ]);
+
+    if (!context) {
+      tracer.log('ERROR', { error: 'No assessment context available' });
+      return { success: false, message: 'Could not read assessment context for this risk.', details: null };
+    }
+
+    tracer.log('INFO', {
+      riskName: risk.name,
+      residualRating: context.residualRatingLabel,
+      hasApprover: !!context.approverUserSysId
+    });
+
+    const draft = await withRetry(() => this.decideAndDraft(risk, context, tracer), 2);
+    if (!draft) {
+      tracer.log('ERROR', { error: 'tool loop did not finalize' });
+      return { success: false, message: 'AI evaluation failed — please retry.', details: null };
+    }
+
+    // ── Pass 2: self-critique — a second, independent look at whether this
+    // specific trigger genuinely warrants an issue, or is borderline/noisy,
+    // with authority to revise the first pass rather than just re-stating it.
+    const decision = await this.critiqueDecision(risk, context, draft, tracer);
+
+    if (!decision.shouldCreateIssue) {
+      tracer.log('END', { outcome: 'skipped', reason: decision.skipReason });
+      await this.writeTrace(riskSysId, 'skipped', { reason: decision.skipReason }, context, risk, tracer);
+      return { success: true, message: `No issue created — ${decision.skipReason}`, details: { skipped: true, reason: decision.skipReason } };
+    }
+
+    // ── Resolve the residual rating onto a real sn_grc_issue_rating row ────
+    const matchedRating = this.matchIssueRating(context.residualRatingLabel, ratingOptions);
+    const finalRating = matchedRating || this.defaultRating(ratingOptions);
+    const ratingNote = matchedRating
+      ? ''
+      : `\n\nNote: could not confidently match the residual rating ("${context.residualRatingLabel || 'not set'}") to a configured issue rating — defaulted to ${finalRating?.label || 'the highest-severity option'} pending manual review.`;
+
+    const rationaleHtml = this.buildRationaleHtml(decision.rationale + ratingNote, risk, context);
+
+    const created = await createIssue.call(this.adapter, {
+      riskSysId,
+      profileSysId: risk.profileSysId,
+      assessmentInstanceSysId,
+      issueRatingSysId: finalRating?.sysId || '',
+      issueManagerSysId: context.approverUserSysId,
+      rationaleHtml,
+      shortDescription: `Risk - ${risk.name} requires an issue following move to Monitor status`,
+      description: `This issue was automatically created because Risk - ${risk.name}${risk.profileName ? ' within ' + risk.profileName : ''} moved to Monitor status following risk assessment. ${decision.summary}`
+    });
+
+    // ── Action plan: a related child record (sn_grc_task), not a field on
+    // the issue itself — created only once the parent issue is verified, and
+    // its own failure never invalidates an otherwise-successful issue create.
+    let actionPlanTaskSysId = '';
+    let actionPlanVerified = true;
+    const createActionPlan = (this.adapter as any).createActionPlanTask;
+    if (created.verified && typeof createActionPlan === 'function' && decision.actionPlan) {
+      // The issue-rating labels ("1 - Very High" .. "5 - Very Low") already
+      // use the same 1-5 scale ServiceNow priority does — reuse the leading
+      // digit rather than inventing a separate mapping.
+      const prioritySn = finalRating?.label.match(/^(\d)/)?.[1] || '';
+      const planResult = await createActionPlan.call(this.adapter, {
+        issueSysId: created.issueSysId,
+        title: decision.actionPlanName || `Action plan for ${risk.name}`,
+        description: decision.actionPlan,
+        ownerSysId: context.approverUserSysId,
+        prioritySn
+      });
+      actionPlanTaskSysId = planResult.taskSysId;
+      actionPlanVerified = planResult.verified;
+      if (!planResult.taskSysId) {
+        tracer.log('WARN', { message: 'Action plan task could not be created for this issue.' });
+      }
+    }
+
+    const outcome = created.verified ? 'created' : 'create_failed';
+    tracer.log('END', { outcome, issueSysId: created.issueSysId, actionPlanTaskSysId });
+    await this.writeTrace(riskSysId, outcome, { issueSysId: created.issueSysId, rating: finalRating?.label, rationale: decision.rationale, actionPlanTaskSysId, actionPlan: decision.actionPlan }, context, risk, tracer);
+
+    return created.verified
+      ? { success: true, message: `Issue created for risk "${risk.name}".`, details: { issueSysId: created.issueSysId, rating: finalRating?.label, actionPlanTaskSysId, actionPlanVerified } }
+      : { success: false, message: 'Issue write could not be verified — platform may have silently dropped a field.', details: { issueSysId: created.issueSysId } };
+  }
+
+  private async writeTrace(riskSysId: string, outcome: string, results: any, context: { assessmentNumber: string }, risk: Risk, tracer: AgentTracer): Promise<void> {
+    const writeTraceM = (this.adapter as any).writeObservabilityTrace;
+    if (typeof writeTraceM !== 'function') return;
+    const summary = outcome === 'skipped'
+      ? `Skipped for risk "${risk.name}" — ${results.reason || 'no reason recorded'}.`
+      : outcome === 'created'
+      ? `Issue created for risk "${risk.name}" (rating: ${results.rating || 'n/a'}). Action plan ${results.actionPlanTaskSysId ? 'created' : 'not created'}.`
+      : `Issue write could not be verified for risk "${risk.name}" — platform may have silently dropped a field.`;
+    try {
+      await writeTraceM.call(this.adapter, {
+        agentName: 'IssueIdentificationAgent',
+        targetId: riskSysId,
+        outcome,
+        results,
+        riskSysId,
+        assessmentNumber: context.assessmentNumber,
+        html: tracer.renderHtml('IssueIdentificationAgent', context.assessmentNumber || risk.name || riskSysId),
+        summary
+      });
+    } catch (_) { /* observability is best-effort — never block the run */ }
+  }
+
+  // Tool declarations + executor for the decision loop. Deliberately lighter
+  // than the CRA agents (2 tools, not 3-4) — the residual rating and approver
+  // are already computed by the platform and handed in as context, so this
+  // agent's only remaining unknowns are the risk's full description and
+  // whether related trouble is already on record for its entity.
+  private buildDecisionTools(risk: Risk): { tools: ToolDeclaration[]; executeTool: (name: string, args: any) => Promise<any> } {
+    const tools: ToolDeclaration[] = [
+      {
+        name: 'get_risk_full_description',
+        description: "Get this risk's full, untruncated description (the description shown above may be truncated).",
+        parameters: { type: 'OBJECT', properties: {} }
+      },
+      {
+        name: 'get_entity_open_issues',
+        description: "Get currently open issues already recorded against this risk's entity — useful context for whether this is already being tracked elsewhere, or whether related problems suggest more urgency.",
+        parameters: { type: 'OBJECT', properties: {} }
+      }
+    ];
+
+    const executeTool = async (name: string, _args: any): Promise<any> => {
+      switch (name) {
+        case 'get_risk_full_description':
+          return { description: risk.description || 'No description provided.' };
+        case 'get_entity_open_issues': {
+          const issues = await this.adapter.getEntityIssues(risk.profileSysId || '');
+          return { issues: issues.map(i => ({ number: i.number, desc: i.desc, state: i.state, priority: i.priority })), count: issues.length };
+        }
+        default:
+          return { error: `Unknown tool: ${name}` };
+      }
+    };
+
+    return { tools, executeTool };
+  }
+
+  // ── Pass 1: investigate-before-concluding tool loop ──────────────────────
+  private async decideAndDraft(risk: Risk, context: { residualRatingLabel: string }, tracer: AgentTracer): Promise<{
+    shouldCreateIssue: boolean; skipReason: string; rationale: string; summary: string; actionPlanName: string; actionPlan: string
+  } | null> {
+    const { tools, executeTool } = this.buildDecisionTools(risk);
+
+    const schema = {
+      type: 'OBJECT',
+      properties: {
+        should_create_issue: { type: 'BOOLEAN' },
+        skip_reason: { type: 'STRING', description: 'Only meaningful if should_create_issue is false.' },
+        rationale: { type: 'STRING', description: 'Full explanation referencing the residual rating, risk description, and any tool evidence gathered.' },
+        summary: { type: 'STRING', description: 'One or two plain-language sentences suitable for the issue description field.' },
+        action_plan_name: { type: 'STRING', description: 'Only meaningful if should_create_issue is true: a short (under 10 words) title for the remediation action plan, e.g. "Patch vendor systems within SLA".' },
+        action_plan: { type: 'STRING', description: 'Only meaningful if should_create_issue is true: a concrete, actionable remediation plan for whoever owns this issue — specific next steps, not a restatement of the rationale. 2-4 short steps is typical. Empty string if should_create_issue is false.' }
+      },
+      required: ['should_create_issue', 'skip_reason', 'rationale', 'summary', 'action_plan_name', 'action_plan']
+    };
+    tools.push({ name: 'submit_decision', description: 'Finalize your issue-creation decision once you have gathered enough evidence.', parameters: schema });
+
+    const initialPrompt = [
+      `RISK: ${risk.name}`,
+      `Description: ${(risk.description || 'No description provided.').substring(0, 600)}`,
+      '(Description above may be truncated — call get_risk_full_description for the complete text.)',
+      risk.profileName ? `Entity: ${risk.profileName}` : '',
+      context.residualRatingLabel ? `Residual rating (calculated by the platform): ${context.residualRatingLabel}` : 'Residual rating: not available',
+      '',
+      'This risk has just moved to Monitor status following its risk assessment.',
+      '',
+      'TASK: Decide whether this genuinely warrants creating a formal tracked issue for remediation, or',
+      'whether ongoing monitoring alone is sufficient. Most risks reaching Monitor status DO warrant an',
+      'issue — only skip when there is a clear reason not to (e.g. residual rating is Low/Very Low and',
+      'nothing in the description or open-issue context suggests urgency). If you decide to create an',
+      'issue, also draft a concrete action plan — specific next steps the issue owner should take, not a',
+      'restatement of why the issue exists. Use the available tools if you need more than what is shown',
+      'above, then call submit_decision with your final answer.'
+    ].filter(Boolean).join('\n');
+
+    const systemInstruction = 'You are Ema, a GRC risk-issue triage assistant. You investigate before you conclude: pull whatever additional evidence you judge necessary via the available tools, then finalize by calling submit_decision. You review risks that have just moved to Monitor status and decide whether they warrant a formally tracked issue — being selective but not reflexively skeptical, since most risks reaching Monitor status do warrant one. When you do create an issue, you also draft a concrete, actionable remediation plan for it.';
+
+    tracer.log('REQUEST', { prompt_preview: initialPrompt });
+
+    const loop = await this.llm.runToolLoop<{
+      should_create_issue: boolean; skip_reason: string; rationale: string; summary: string; action_plan_name: string; action_plan: string;
+    }>(systemInstruction, initialPrompt, tools, 'submit_decision', executeTool, 4);
+
+    if (!loop) return null;
+
+    tracer.log('RESPONSE', { shouldCreateIssue: loop.result.should_create_issue, toolCalls: loop.toolCallLog.map(c => c.name) });
+
+    return {
+      shouldCreateIssue: !!loop.result.should_create_issue,
+      skipReason: loop.result.skip_reason || '',
+      rationale: loop.result.rationale || '',
+      summary: loop.result.summary || '',
+      actionPlanName: loop.result.action_plan_name || '',
+      actionPlan: loop.result.action_plan || ''
+    };
+  }
+
+  // ── Pass 2: self-critique ─────────────────────────────────────────────────
+  // A second, independent pass explicitly told the first-pass conclusion and
+  // asked to find fault with it — same reflection standard as the CRA agents'
+  // critique passes, scoped to one item since this agent runs per-risk rather
+  // than in a batch. A failed or unparseable critique leaves the draft
+  // untouched rather than corrupting it.
+  private async critiqueDecision(
+    risk: Risk, context: { residualRatingLabel: string },
+    draft: { shouldCreateIssue: boolean; skipReason: string; rationale: string; summary: string; actionPlanName: string; actionPlan: string },
+    tracer: AgentTracer
+  ): Promise<{ shouldCreateIssue: boolean; skipReason: string; rationale: string; summary: string; actionPlanName: string; actionPlan: string }> {
+    const schema = {
+      type: 'OBJECT',
+      properties: {
+        action: { type: 'STRING', enum: ['keep', 'revise'] },
+        should_create_issue: { type: 'BOOLEAN' },
+        skip_reason: { type: 'STRING', description: 'Required and non-empty whenever should_create_issue is false — this is what gets shown as the reason no issue was created, so it must stand on its own, not just restate critique_note.' },
+        rationale: { type: 'STRING' },
+        summary: { type: 'STRING' },
+        action_plan_name: { type: 'STRING', description: 'Only meaningful if should_create_issue is true.' },
+        action_plan: { type: 'STRING', description: 'Only meaningful if should_create_issue is true — revise the first pass\'s action plan if it was vague or not actionable, otherwise keep it.' },
+        critique_note: { type: 'STRING', description: 'Why you kept or revised the first-pass decision.' }
+      },
+      required: ['action', 'should_create_issue', 'skip_reason', 'rationale', 'summary', 'action_plan_name', 'action_plan', 'critique_note']
+    };
+
+    const prompt = [
+      `RISK: ${risk.name}`,
+      context.residualRatingLabel ? `Residual rating: ${context.residualRatingLabel}` : '',
+      '',
+      'FIRST-PASS DECISION:',
+      `should_create_issue: ${draft.shouldCreateIssue}`,
+      draft.shouldCreateIssue ? `Rationale: ${draft.rationale}` : `Skip reason: ${draft.skipReason}`,
+      draft.shouldCreateIssue ? `Action plan: ${draft.actionPlan}` : '',
+      '',
+      'TASK: Review this decision critically. Is it genuinely warranted, or is the Monitor-status trigger',
+      'borderline/noisy for this specific risk? You have authority to REVISE the decision (flip whether an',
+      'issue should be created) if the first pass got it wrong. Otherwise KEEP it as-is. If the decision is',
+      'to create an issue, also review the action plan: revise it if it is vague or not actually actionable,',
+      'otherwise keep it as drafted.'
+    ].filter(Boolean).join('\n');
+
+    const systemInstruction = 'You are Ema, reviewing your own prior first-pass decision as an independent second check. Find fault with it if warranted; otherwise confirm it.';
+
+    try {
+      const parsed = await this.llm.generateStructuredOutput<{
+        action: string; should_create_issue: boolean; skip_reason?: string; rationale: string; summary: string;
+        action_plan_name?: string; action_plan?: string; critique_note: string;
+      }>(prompt, systemInstruction, schema);
+      tracer.log('CRITIQUE', { action: parsed.action, note: parsed.critique_note });
+      if (parsed.action === 'revise') {
+        const shouldCreateIssue = !!parsed.should_create_issue;
+        return {
+          shouldCreateIssue,
+          // Falls back to critique_note if skip_reason came back empty despite
+          // being required — confirmed live: a revise-to-skip response can
+          // otherwise surface an empty reason even though the critique itself
+          // gave a perfectly good explanation for the reversal.
+          skipReason: shouldCreateIssue ? '' : (parsed.skip_reason || parsed.critique_note || ''),
+          rationale: parsed.rationale || draft.rationale,
+          summary: parsed.summary || draft.summary,
+          actionPlanName: shouldCreateIssue ? (parsed.action_plan_name || draft.actionPlanName) : '',
+          actionPlan: shouldCreateIssue ? (parsed.action_plan || draft.actionPlan) : ''
+        };
+      }
+      return draft;
+    } catch (e: any) {
+      tracer.log('WARN', { message: `Critique pass failed (${e.message}) — keeping first-pass decision.` });
+      return draft;
+    }
+  }
+
+  // Fuzzy-matches the platform's residual rating label onto one of the 5
+  // configured sn_grc_issue_rating rows ("1 - Very High" .. "5 - Very Low").
+  // Confirmed live that a naive "does the option label contain 'high'" check
+  // is not enough: "1 - Very High" also contains the substring "high", so a
+  // plain residual rating of "High" was matching the wrong (more severe)
+  // option. Word-boundary regex plus an explicit "not very-" exclusion on the
+  // option side fixes both directions.
+  private matchIssueRating(residualLabel: string, options: Array<{ sysId: string; label: string }>): { sysId: string; label: string } | null {
+    if (!residualLabel || options.length === 0) return null;
+    const norm = residualLabel.toLowerCase().trim();
+    const find = (predicate: (label: string) => boolean) => options.find(o => predicate(o.label.toLowerCase())) || null;
+
+    if (norm.includes('very high')) return find(l => l.includes('very high'));
+    if (norm.includes('very low')) return find(l => l.includes('very low'));
+    if (/\bhigh\b/.test(norm)) return find(l => l.includes('high') && !l.includes('very high'));
+    if (/\b(moderate|medium)\b/.test(norm)) return find(l => l.includes('moderate'));
+    if (/\blow\b/.test(norm)) return find(l => l.includes('low') && !l.includes('very low'));
+
+    return null;
+  }
+
+  // Fail-safe default when the residual rating can't be confidently matched:
+  // err toward the highest-severity option rather than silently understating
+  // risk (Section 5.8 of this system's governance standard — explicit
+  // fail-safe behavior, never a silent best guess).
+  private defaultRating(options: Array<{ sysId: string; label: string }>): { sysId: string; label: string } | null {
+    return options.find(o => o.label.toLowerCase().includes('very high')) || options[0] || null;
+  }
+
+  private buildRationaleHtml(text: string, risk: Risk, context: { residualRatingLabel: string }): string {
+    return [
+      `${htmlLabel('Ema — Automated Issue Rationale')}`,
+      `${htmlLabel('Risk:')} ${htmlEscape(risk.name)}<br>${htmlLabel('Residual rating at time of review:')} ${htmlEscape(context.residualRatingLabel || 'Not set')}`,
+      htmlEscape(text)
+    ].join('<br><br>');
+  }
+
 }
 
 // ============================================================================

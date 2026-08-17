@@ -1,9 +1,15 @@
 import { Risk, Control, TestEvidence, AssessmentInstance, Factor, FactorResponse } from '../core/models';
+import { FieldMetadata, PlatformTerminology, FieldRelationship } from '../core/generated_adapter_config';
 
 export abstract class BaseGRCAdapter {
   // Metadata
   abstract getEntityLabel(): string;
   abstract getPlatformName(): string;
+
+  // Field metadata (discovered during schema discovery, used for smart formatting)
+  getFieldMetadata(): FieldMetadata[] | undefined { return undefined; }
+  getTerminology(): PlatformTerminology | undefined { return undefined; }
+  getFieldRelationships(): FieldRelationship[] | undefined { return undefined; }
 
   // Read Operations
   abstract getEntityIssues(profileSysId: string): Promise<Array<{ desc: string; state: string; number?: string; priority?: string }>>;
@@ -27,7 +33,12 @@ export abstract class BaseGRCAdapter {
     ratingLabel: string;
   } | null>;
   
-  // Write Operations
+  // Write Operations — each returns whether the write was VERIFIED (read back
+  // and confirmed the critical field(s) actually landed), not just that the
+  // HTTP call didn't throw. ServiceNow has been observed returning 200/201
+  // while silently dropping a field's value on certain tables — a plain
+  // "didn't throw" check missed that. Adapters with no evidence of this
+  // failure mode may simply return true after a successful write.
   abstract writeControlEffectiveness(
     rowSysId: string,
     score: number,
@@ -36,8 +47,8 @@ export abstract class BaseGRCAdapter {
     evidenceSummary: string,
     auditTrail: string,
     fingerprint: string
-  ): Promise<void>;
-  
+  ): Promise<boolean>;
+
   abstract writeInherentFactor(
     rowSysId: string,
     score: number,
@@ -45,7 +56,7 @@ export abstract class BaseGRCAdapter {
     justification: string,
     comment: string,
     auditTrail: string
-  ): Promise<void>;
+  ): Promise<boolean>;
 
   abstract writeRiskControlMapping(
     riskSysId: string,
@@ -53,7 +64,7 @@ export abstract class BaseGRCAdapter {
     justification: string,
     gaps: string,
     recommendations: string
-  ): Promise<void>;
-  
+  ): Promise<boolean>;
+
   abstract writeFailure(rowSysId: string, reason: string): Promise<void>;
 }
