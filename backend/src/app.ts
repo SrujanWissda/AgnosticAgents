@@ -1,6 +1,7 @@
 import express from 'express';
 import cors from 'cors';
 import dotenv from 'dotenv';
+import axios from 'axios';
 dotenv.config();
 import { ServiceNowAdapter } from './adapters/servicenow';
 import { SalesforceAdapter } from './adapters/salesforce';
@@ -387,6 +388,51 @@ app.get('/api/platforms/:platformName/assessments', async (req, res) => {
 
 // Export for Vercel (and other serverless runtimes) which import the app
 // directly without calling listen(). Local Express dev still calls listen().
+// Diagnostic endpoint: describe any Salesforce object by name
+// Usage: GET /api/debug/salesforce/describe/Ema_Audit_Trail__c
+app.get('/api/debug/salesforce/describe/:objectName', async (req, res) => {
+  try {
+    const { objectName } = req.params;
+
+    // Use the Salesforce adapter to query the describe API
+    const token = (salesforceAdapter as any).getAccessToken ?
+      await (salesforceAdapter as any).getAccessToken() :
+      null;
+
+    if (!token) {
+      return res.status(401).json({ error: 'Salesforce credentials not configured' });
+    }
+
+    const instanceUrl = (salesforceAdapter as any).instanceUrl;
+
+    const response = await axios.get(
+      `${instanceUrl}/services/data/v60.0/sobjects/${objectName}/describe`,
+      { headers: { Authorization: `Bearer ${token}` } }
+    );
+
+    const describe = response.data;
+
+    // Return simplified field list
+    const fields = (describe as any).fields.map((f: any) => ({
+      name: f.name,
+      label: f.label,
+      type: f.type,
+      updateable: f.updateable,
+      createable: f.createable,
+      length: f.length,
+      custom: f.custom
+    }));
+
+    res.json({
+      objectName,
+      totalFields: fields.length,
+      fields
+    });
+  } catch (e: any) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 export default app;
 
 // Server bootup — skipped on Vercel where the platform invokes the handler directly
