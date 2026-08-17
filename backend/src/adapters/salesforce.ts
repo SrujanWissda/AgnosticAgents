@@ -874,12 +874,11 @@ export class SalesforceAdapter extends BaseGRCAdapter {
     try {
       const token = await this.getAccessToken();
       // Try to create a dedicated EMA audit trail record first
-      // Note: Using Ema_Audit_Trail__c object with standard field naming
+      // Note: Using discovered Ema_Audit_Trail__c object with actual fields
       const payload: any = {
-        Assessment_Record_Id__c: recordSysId,
-        Assessment_Type__c: assessmentType,
-        Record_Type__c: recordType,
-        Audit_Trail_Details__c: auditTrailHtml
+        Name: `${assessmentType} - ${recordSysId.substring(0, 10)}`,
+        Ema_Audit_Summary__c: auditTrailHtml,
+        Risk_Assessment_Number__c: recordType // Store the object type being assessed
       };
 
       try {
