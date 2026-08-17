@@ -20,3 +20,4 @@ backend/generated_adapters/*.json
 Thumbs.db
 
 .vercel
+.env*

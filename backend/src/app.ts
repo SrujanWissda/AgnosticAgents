@@ -6,7 +6,7 @@ import { ServiceNowAdapter } from './adapters/servicenow';
 import { SalesforceAdapter } from './adapters/salesforce';
 import { DynamicAdapter } from './adapters/dynamic_adapter';
 import { SalesforceDescribeConnector } from './adapters/connectors/salesforce_describe';
-import { GeminiLLMClient } from './llm/llm_client';
+import { GeminiLLMClient, GroqLLMClient } from './llm/llm_client';
 import { GeminiEmbeddingsClient } from './llm/embeddings_client';
 import { VectorStore } from './core/vector_store';
 import { UniversalSchemaDiscoveryAgent } from './core/universal_schema_discovery_agent';
@@ -14,9 +14,12 @@ import { listAllAdapterConfigs, GeneratedAdapterConfig } from './core/generated_
 import {
   ControlEffectivenessAgent,
   InherentAssessmentAgent,
-  RiskControlMappingAgent
+  RiskControlMappingAgent,
+  IssueIdentificationAgent
 } from './core/agents';
 import { withTrace, currentTrace, recentTraces, computeStats } from './core/observability';
+import { runIntegrityScan } from './core/integrity_scan';
+import { VerificationAgent } from './core/verification_agent';
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -32,6 +35,10 @@ app.use((req, res, next) => {
 
 // Initialize core client and adapters
 const llmClient = new GeminiLLMClient();
+// Separate client/provider from llmClient above — used ONLY by the
+// verification layer, deliberately never by any producer agent, so the
+// checker can never share the producer's blind spots.
+const groqClient = new GroqLLMClient();
 const embeddingsClient = new GeminiEmbeddingsClient();
 const vectorStore = new VectorStore();
 const universalDiscoveryAgent = new UniversalSchemaDiscoveryAgent(llmClient, embeddingsClient, vectorStore);
@@ -77,7 +84,8 @@ app.get('/api/platforms', (req, res) => {
     agents: [
       { id: 'control-effectiveness', name: 'Control Effectiveness Agent', description: 'Batch assesses control effectiveness against test evidence and audit runs.' },
       { id: 'inherent-assessment', name: 'Inherent Assessment Agent', description: 'Evaluates inherent factors (PII sensitivity, threat model) using guidance rubrics.' },
-      { id: 'risk-control-mapping', name: 'Risk-Control Mapping Agent', description: 'Analyses entity risks and maps relevant mitigating controls from library.' }
+      { id: 'risk-control-mapping', name: 'Risk-Control Mapping Agent', description: 'Analyses entity risks and maps relevant mitigating controls from library.' },
+      { id: 'issue-identification', name: 'Issue Identification Agent', description: 'Drafts a tracked issue for a risk, given its sys_id — trigger is external (e.g. a ServiceNow client script), not scan-based.' }
     ]
   });
 });
@@ -104,7 +112,7 @@ app.post('/api/run-agent', async (req, res) => {
     originalLog(...args);
   };
 
-  if (!['control-effectiveness', 'inherent-assessment', 'risk-control-mapping'].includes(agent)) {
+  if (!['control-effectiveness', 'inherent-assessment', 'risk-control-mapping', 'issue-identification'].includes(agent)) {
     console.log = originalLog;
     return res.status(400).json({ error: `Unsupported agent action: ${agent}` });
   }
@@ -119,6 +127,8 @@ app.post('/api/run-agent', async (req, res) => {
         return new ControlEffectivenessAgent(adapter, llmClient).execute(targetId);
       } else if (agent === 'inherent-assessment') {
         return new InherentAssessmentAgent(adapter, llmClient).execute(targetId);
+      } else if (agent === 'issue-identification') {
+        return new IssueIdentificationAgent(adapter, llmClient).execute(targetId);
       } else {
         return new RiskControlMappingAgent(adapter, llmClient).execute(targetId);
       }
@@ -133,6 +143,17 @@ app.post('/api/run-agent', async (req, res) => {
       traceId,
       logs
     });
+
+    // ── Verification layer (pilot: Control Effectiveness only) ──────────────
+    // Fired AFTER the response is sent, not awaited — this must never add
+    // latency to the producer agent's response or affect it in any way.
+    // Independent of and unrelated to the producer's own success/failure;
+    // errors here are logged and swallowed, never surfaced to the caller.
+    if (agent === 'control-effectiveness' && groqClient.isLive()) {
+      new VerificationAgent(adapter, groqClient).verifyControlEffectiveness(targetId)
+        .then(v => console.log(`[VerificationAgent] ${v.success ? 'OK' : 'skipped'}: ${v.message}`))
+        .catch(e => console.warn(`[VerificationAgent] Failed: ${e.message}`));
+    }
   } catch (error: any) {
     console.log = originalLog;
     res.status(500).json({
@@ -146,13 +167,53 @@ app.post('/api/run-agent', async (req, res) => {
 // ============================================================================
 // AI Observability endpoints
 // ============================================================================
-app.get('/api/observability/traces', (req, res) => {
+app.get('/api/observability/traces', async (req, res) => {
   const limit = Math.min(parseInt(String(req.query.limit || '20'), 10) || 20, 100);
-  res.json({ success: true, traces: recentTraces(limit) });
+  const kind = req.query.kind ? String(req.query.kind) : undefined;
+  res.json({ success: true, traces: await recentTraces(limit, kind) });
 });
 
-app.get('/api/observability/stats', (req, res) => {
-  res.json({ success: true, stats: computeStats() });
+app.get('/api/observability/stats', async (req, res) => {
+  res.json({ success: true, stats: await computeStats() });
+});
+
+// ============================================================================
+// Integrity scan — the async half of the "0 issues" monitoring pair. The
+// synchronous writeVerified() check inside agents.ts catches a bad write the
+// instant it happens; this catches drift (a field that was fine right after
+// the write but got cleared by something else afterward — confirmed possible
+// on this project). Meant to be hit by a scheduler (Vercel Cron, see
+// vercel.json), not a human — gated by a shared secret since it triggers real
+// writes (flagging affected records) against the live platform, same as
+// /api/run-agent.
+// ============================================================================
+app.get('/api/health/integrity-scan', async (req, res) => {
+  // Vercel automatically sends CRON_SECRET as `Authorization: Bearer <value>`
+  // on cron-triggered requests — this is Vercel's own documented mechanism,
+  // not a custom header, so a scheduled invocation authenticates for free.
+  const cronSecret = process.env.CRON_SECRET;
+  if (cronSecret) {
+    if (req.get('authorization') !== `Bearer ${cronSecret}`) {
+      return res.status(401).json({ success: false, error: 'Missing or invalid Authorization header.' });
+    }
+  } else {
+    console.warn('[IntegrityScan] CRON_SECRET is not set — endpoint is running unauthenticated.');
+  }
+
+  const sinceHours = Math.min(Math.max(parseInt(String(req.query.sinceHours || '6'), 10) || 6, 1), 72);
+
+  try {
+    const results = await withTrace('integrity-scan', { sinceHours }, async () => {
+      const servicenowResult = await runIntegrityScan(new ServiceNowAdapter(), sinceHours);
+      const salesforceResult = await runIntegrityScan(salesforceAdapter, sinceHours);
+      return [servicenowResult, salesforceResult];
+    });
+
+    const totalFindings = results.reduce((sum, r) => sum + r.findings.length, 0);
+    res.json({ success: true, totalFindings, results });
+  } catch (error: any) {
+    res.status(500).json({ success: false, error: error.message });
+  }
 });
 
 // Endpoint to list all available risks from ServiceNow (live or mock)

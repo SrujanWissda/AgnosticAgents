@@ -253,6 +253,8 @@ function setupFormListeners() {
   document.getElementById('btn-live-discover').addEventListener('click', handleLiveDiscover);
   document.getElementById('btn-obs-refresh').addEventListener('click', refreshObservability);
   document.getElementById('tab-observability').addEventListener('click', refreshObservability);
+  document.getElementById('btn-integrity-run').addEventListener('click', runIntegrityScanNow);
+  document.getElementById('tab-integrity').addEventListener('click', loadIntegrityHistory);
 }
 
 // ============================================================================
@@ -411,6 +413,165 @@ function renderObservabilityTraces() {
       <div class="obs-spans">${spanRows || '<p class="field-hint">No spans recorded.</p>'}</div>
     </div>`;
   }).join('');
+}
+
+// ============================================================================
+// Integrity Monitoring
+//
+// A separate tab from Observability on purpose: Observability is a record of
+// every agent RUN; this is a record of every integrity SCAN (the async check
+// that catches a field drifting empty after the fact — see /api/health/integrity-scan).
+// Rendering below is driven entirely by whatever `platform` string each
+// adapter's scan result reports — no ServiceNow/Salesforce-specific branches,
+// so a future adapter (Archer or otherwise) that implements
+// scanForIntegrityIssues() shows up here automatically.
+// ============================================================================
+async function runIntegrityScanNow() {
+  const btn = document.getElementById('btn-integrity-run');
+  const statusEl = document.getElementById('integrity-run-status');
+
+  if (isStandaloneMode) {
+    statusEl.innerHTML = '<p class="field-hint">Integrity scanning needs a connected backend server (currently in Standalone Simulation Mode).</p>';
+    return;
+  }
+
+  btn.disabled = true;
+  statusEl.innerHTML = '<p class="field-hint">Scanning recently-updated records on every connected platform...</p>';
+
+  const sinceHours = 24;
+
+  try {
+    const res = await fetch(`${API_BASE}/health/integrity-scan?sinceHours=${sinceHours}`);
+    const data = await res.json();
+
+    if (res.status === 401) {
+      statusEl.innerHTML = '<p class="field-hint">This environment protects on-demand scans with a cron secret, so it can\'t be triggered from the browser here — it still runs automatically on schedule. See Scan History below for past runs.</p>';
+      return;
+    }
+    if (!data.success) {
+      statusEl.innerHTML = `<p class="field-hint">Scan failed: ${escapeHtml(data.error || 'unknown error')}</p>`;
+      return;
+    }
+
+    statusEl.innerHTML = renderIntegrityScanDetail(data, sinceHours);
+    await loadIntegrityHistory();
+  } catch (err) {
+    statusEl.innerHTML = `<p class="field-hint">Scan failed: ${escapeHtml(err.message)}</p>`;
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+/**
+ * Full "what just happened" breakdown for a just-run scan: one open card per
+ * platform showing what was checked and, if anything was wrong, exactly what
+ * and where — not just a pass/fail count. Same building block (integrityPlatformCard)
+ * powers the Scan History cards below, so a live run and a historical one look identical.
+ */
+function renderIntegrityScanDetail(data, sinceHours) {
+  const results = data.results || [];
+  const platformCards = results.map(r => integrityPlatformCard({
+    platform: r.platform,
+    supported: r.supported,
+    findings: r.findings || [],
+    sinceHours
+  })).join('');
+
+  return `<div class="obs-trace open">
+    <div class="obs-trace-header" style="cursor:default;">
+      <div>
+        <div class="obs-trace-title">Scan Results</div>
+        <div class="obs-trace-sub">${new Date().toLocaleString()} · ${results.length} platform(s) checked · last ${sinceHours}h window</div>
+      </div>
+      <span class="obs-badge ${data.totalFindings > 0 ? 'fallback' : 'ok'}">${data.totalFindings > 0 ? data.totalFindings + ' finding(s)' : 'clean'}</span>
+    </div>
+    <div class="obs-spans">${platformCards || '<p class="field-hint">No platforms returned a result.</p>'}</div>
+  </div>`;
+}
+
+/**
+ * One platform's detail row — used by both the just-run view and Scan History.
+ * Shows what was checked (table-level checks the adapter runs: rated factors
+ * missing comments, rated assessments missing justification summaries) and,
+ * when something's wrong, the specific record, issue, and context — no
+ * platform-specific branching, driven entirely by the `platform` string and
+ * `findings` array the adapter's own scan reported.
+ */
+function integrityPlatformCard({ platform, supported, findings, sinceHours }) {
+  if (!supported) {
+    return `<div class="obs-span">
+      <div style="flex:1; min-width:0;">
+        <span class="obs-badge ok">not applicable</span> ${escapeHtml(platform)}
+        <div class="obs-span-meta">This adapter doesn't implement an integrity scan yet — nothing was checked here.</div>
+      </div>
+    </div>`;
+  }
+
+  const badgeCls = findings.length > 0 ? 'fallback' : 'ok';
+  const badgeText = findings.length > 0 ? `${findings.length} finding(s)` : 'clean';
+  const windowText = sinceHours !== undefined ? `records updated in the last ${sinceHours}h` : 'recently-updated records';
+
+  const findingsList = findings.length > 0
+    ? findings.map(f => `<div class="obs-span-detail-row">⚠️ <strong>${escapeHtml(f.recordType)}</strong> — ${escapeHtml(f.issue)}<br><span class="obs-span-meta">${escapeHtml(f.context)} · record ${escapeHtml(f.recordId)}</span></div>`).join('')
+    : `<div class="obs-span-meta" style="margin-top:0.3rem;">Checked ${windowText} for rated factors/controls missing their required narrative (comments, justification summaries) — none found.</div>`;
+
+  return `<div class="obs-span" style="display:block;">
+    <div style="display:flex; justify-content:space-between; align-items:baseline; gap:0.75rem;">
+      <div><span class="obs-badge ${badgeCls}">${badgeText}</span> ${escapeHtml(platform)}</div>
+    </div>
+    <div style="margin-top:0.4rem;">${findingsList}</div>
+  </div>`;
+}
+
+let integrityTraces = [];
+
+async function loadIntegrityHistory() {
+  const historyEl = document.getElementById('integrity-history');
+
+  if (isStandaloneMode) {
+    historyEl.innerHTML = '<p class="field-hint">Scan history needs a connected backend server (currently in Standalone Simulation Mode).</p>';
+    return;
+  }
+
+  try {
+    const res = await fetch(`${API_BASE}/observability/traces?kind=integrity-scan&limit=20`);
+    const data = await res.json();
+    integrityTraces = data.traces || [];
+
+    if (integrityTraces.length === 0) {
+      historyEl.innerHTML = '<p class="field-hint">No scan runs recorded yet — click Refresh, or Run Scan Now above.</p>';
+      return;
+    }
+
+    historyEl.innerHTML = integrityTraces.map(t => {
+      // Each platform scanned within this run recorded its own span — see
+      // recordSpan('integrity.scan', ...) in backend/src/core/integrity_scan.ts.
+      const scanSpans = (t.spans || []).filter(sp => sp.name === 'integrity.scan');
+
+      const platformCards = scanSpans.map(sp => {
+        const m = sp.meta || {};
+        return integrityPlatformCard({
+          platform: m.platform || 'unknown platform',
+          supported: m.supported,
+          findings: m.findings || [],
+          sinceHours: m.sinceHours
+        });
+      }).join('');
+
+      return `<div class="obs-trace">
+        <div class="obs-trace-header" onclick="this.parentElement.classList.toggle('open')">
+          <div>
+            <div class="obs-trace-title">Integrity Scan</div>
+            <div class="obs-trace-sub">${new Date(t.startedAt).toLocaleString()} · ${scanSpans.length} platform(s) · trace ${t.traceId}</div>
+          </div>
+          <span class="obs-badge ${t.status || 'ok'}">${t.status || '?'}</span>
+        </div>
+        <div class="obs-spans">${platformCards || '<p class="field-hint">No platform results recorded.</p>'}</div>
+      </div>`;
+    }).join('');
+  } catch (err) {
+    historyEl.innerHTML = `<p class="field-hint">Failed to load scan history: ${escapeHtml(err.message)}</p>`;
+  }
 }
 
 // ============================================================================

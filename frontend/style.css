@@ -687,6 +687,15 @@ pre {
   overflow-wrap: anywhere;
 }
 
+.obs-span-detail-row {
+  padding: 0.3rem 0;
+  overflow-wrap: anywhere;
+}
+
+.obs-span-detail-row + .obs-span-detail-row {
+  border-top: 1px dotted rgba(255, 255, 255, 0.06);
+}
+
 .obs-filter-row {
   display: flex;
   align-items: center;

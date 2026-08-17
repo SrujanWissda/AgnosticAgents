@@ -1,5 +1,6 @@
 <!DOCTYPE html>
 <html lang="en">
+
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
@@ -7,11 +8,14 @@
   <!-- Google Fonts Outfit & Inter -->
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=Outfit:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+  <link
+    href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=Outfit:wght@400;500;600;700;800&display=swap"
+    rel="stylesheet">
   <link rel="stylesheet" href="style.css">
 </head>
+
 <body>
-  
+
   <div class="glow-bg"></div>
 
   <div class="app-container">
@@ -27,7 +31,8 @@
       <div class="header-status">
         <span class="status-dot green"></span>
         <span id="connection-status">Detecting Server...</span>
-        <button class="btn-retry-connection" id="btn-retry-connection" onclick="retryBackendConnection()" title="Re-check server connection">&#8635;</button>
+        <button class="btn-retry-connection" id="btn-retry-connection" onclick="retryBackendConnection()"
+          title="Re-check server connection">&#8635;</button>
       </div>
     </header>
 
@@ -36,6 +41,7 @@
       <button class="tab-btn active" id="tab-sandbox">Agent Sandbox</button>
       <button class="tab-btn" id="tab-onboarding">Schema Onboarding Agent</button>
       <button class="tab-btn" id="tab-observability">Observability</button>
+      <button class="tab-btn" id="tab-integrity">Integrity Monitoring</button>
       <button class="tab-btn" id="tab-architecture">System Architecture</button>
     </nav>
 
@@ -45,11 +51,11 @@
       <!-- View 1: Agent Sandbox -->
       <section class="tab-content active" id="content-sandbox">
         <div class="grid-layout">
-          
+
           <!-- Column 1: Configuration Panel -->
           <div class="glass-card config-panel">
             <h2 class="section-title">Execution Controls</h2>
-            
+
             <div class="form-group">
               <label for="select-platform">Target GRC Platform</label>
               <div class="select-wrapper">
@@ -146,7 +152,10 @@
         <div class="onboard-layout">
           <div class="glass-card onboard-input-card onboard-live-card">
             <h2>Live Discovery (Universal Schema Discovery Agent)</h2>
-            <p>Connects directly to a live Salesforce org, introspects its real object schema, vector-matches tables/fields against our agnostic models, confirms the mapping with the LLM, then validates against live sample records — producing a config the 3 reasoning agents can run against immediately, with zero new adapter code.</p>
+            <p>Connects directly to a live Salesforce org, introspects its real object schema, vector-matches
+              tables/fields against our agnostic models, confirms the mapping with the LLM, then validates against live
+              sample records — producing a config the 3 reasoning agents can run against immediately, with zero new
+              adapter code.</p>
 
             <div class="form-group">
               <label for="text-live-platform-name">New Platform Name</label>
@@ -167,8 +176,10 @@
 
           <div class="glass-card onboard-input-card">
             <h2>Add New GRC Tool Integration (Paste Mode)</h2>
-            <p>Paste a raw API response, database table schema, or unstructured documentation from a target GRC tool. The Schema Discovery Agent will dynamically create field mapping models to match our platform-agnostic models.</p>
-            
+            <p>Paste a raw API response, database table schema, or unstructured documentation from a target GRC tool.
+              The Schema Discovery Agent will dynamically create field mapping models to match our platform-agnostic
+              models.</p>
+
             <div class="form-group">
               <label for="text-metadata">Platform Schema / Documentation Details</label>
               <textarea id="text-metadata" placeholder="Example:
@@ -202,9 +213,12 @@ Columns:
         <div class="glass-card" style="margin-bottom: 1.5rem;">
           <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom: 1rem;">
             <h2 style="margin:0;">AI Observability</h2>
-            <button class="btn btn-primary" id="btn-obs-refresh" style="width:auto; padding: 0.5rem 1.25rem;">Refresh</button>
+            <button class="btn btn-primary" id="btn-obs-refresh"
+              style="width:auto; padding: 0.5rem 1.25rem;">Refresh</button>
           </div>
-          <p>Every agent execution is recorded as a trace: each LLM call, embedding call, and platform query/write inside it becomes a span with latency, outcome, and any self-healing actions taken. Data persists in <code>backend/data/traces.jsonl</code>.</p>
+          <p>Every agent execution is recorded as a trace: each LLM call, embedding call, and platform query/write
+            inside it becomes a span with latency, outcome, and any self-healing actions taken. Data persists in
+            <code>backend/data/traces.jsonl</code>.</p>
           <div class="obs-stats-grid" id="obs-stats">
             <!-- JS populated stat tiles -->
           </div>
@@ -213,12 +227,41 @@ Columns:
         <div class="glass-card">
           <h2>Recent Traces</h2>
           <div class="obs-filter-row">
-            <input type="text" id="obs-search" placeholder="Search platform, agent, table, SOQL, error text..." oninput="renderObservabilityTraces()">
-            <label class="obs-filter-checkbox"><input type="checkbox" id="obs-errors-only" onchange="renderObservabilityTraces()"> Errors/fallbacks only</label>
-            <button class="btn-retry-connection" id="btn-obs-expand-all" onclick="toggleAllTraces()" title="Expand/collapse all">Expand all</button>
+            <input type="text" id="obs-search" placeholder="Search platform, agent, table, SOQL, error text..."
+              oninput="renderObservabilityTraces()">
+            <label class="obs-filter-checkbox"><input type="checkbox" id="obs-errors-only"
+                onchange="renderObservabilityTraces()"> Errors/fallbacks only</label>
+            <button class="btn-retry-connection" id="btn-obs-expand-all" onclick="toggleAllTraces()"
+              title="Expand/collapse all">Expand all</button>
           </div>
           <div id="obs-traces">
             <p class="field-hint">No traces yet — run an agent from the Sandbox tab, then hit Refresh.</p>
+          </div>
+        </div>
+      </section>
+
+      <!-- View: Integrity Monitoring -->
+      <section class="tab-content" id="content-integrity">
+        <div class="glass-card" style="margin-bottom: 1.5rem;">
+          <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom: 1rem;">
+            <h2 style="margin:0;">Integrity Monitoring</h2>
+            <button class="btn btn-primary" id="btn-integrity-run" style="width:auto; padding: 0.5rem 1.25rem;">Run Scan Now</button>
+          </div>
+          <p>Writes can report success while a platform silently drops a field, and a field that looked fine right
+            after a write can still get cleared by something else afterward. This scan re-reads recently-updated
+            records on every connected platform and flags anything that doesn't add up — it runs automatically once
+            a day via a scheduled job, and the same check can be triggered on demand below. Rendering is generic:
+            any adapter that implements a scan shows up here automatically, with no platform-specific code.</p>
+          <div id="integrity-run-status"></div>
+        </div>
+
+        <div class="glass-card">
+          <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom: 1rem;">
+            <h2 style="margin:0;">Scan History</h2>
+            <button class="btn-retry-connection" id="btn-integrity-refresh" onclick="loadIntegrityHistory()">Refresh</button>
+          </div>
+          <div id="integrity-history">
+            <p class="field-hint">No scan history yet — click Refresh, or Run Scan Now above.</p>
           </div>
         </div>
       </section>
@@ -227,8 +270,9 @@ Columns:
       <section class="tab-content" id="content-architecture">
         <div class="glass-card architecture-card">
           <h2>Platform Agnostic GRC Architecture</h2>
-          <p>By decoupling the GRC platform adapters, reasoning engine, and LLM interfaces, you can plug in any platform API or switch LLM providers without touching the core validation and compliance logic.</p>
-          
+          <p>By decoupling the GRC platform adapters, reasoning engine, and LLM interfaces, you can plug in any platform
+            API or switch LLM providers without touching the core validation and compliance logic.</p>
+
           <div class="arch-diagram">
             <!-- ServiceNow Adapter Node -->
             <div class="arch-box plat-node">
@@ -236,14 +280,14 @@ Columns:
               <p>GlideRecord & REST Tables</p>
               <div class="arch-badge">Platform Adapter</div>
             </div>
-            
+
             <!-- Salesforce Adapter Node -->
             <div class="arch-box plat-node">
               <h4>Salesforce GRC</h4>
               <p>SOQL & Custom Objects</p>
               <div class="arch-badge">Platform Adapter</div>
             </div>
-            
+
             <!-- Archer Adapter Node -->
             <div class="arch-box plat-node pending">
               <h4>Future Platform</h4>
@@ -283,15 +327,18 @@ Columns:
           <div class="advantages-grid">
             <div class="advantage-item">
               <h5>🛡️ Zero-Access Core</h5>
-              <p>Core logic works solely on unified schema structures. Platform bugs, table modifications, or access control failures stay contained within the adapter layer.</p>
+              <p>Core logic works solely on unified schema structures. Platform bugs, table modifications, or access
+                control failures stay contained within the adapter layer.</p>
             </div>
             <div class="advantage-item">
               <h5>⚡ Cost & Speed Optimization</h5>
-              <p>Calculates database fingerprints from active evidence and queries prior closed audits to reuse answers. Identical states carry forward instantly with zero LLM API costs.</p>
+              <p>Calculates database fingerprints from active evidence and queries prior closed audits to reuse answers.
+                Identical states carry forward instantly with zero LLM API costs.</p>
             </div>
             <div class="advantage-item">
               <h5>🔌 Instant Onboarding</h5>
-              <p>Using the Schema Discovery Agent, entering raw GRC API properties generates instant translation bindings for new platforms in seconds.</p>
+              <p>Using the Schema Discovery Agent, entering raw GRC API properties generates instant translation
+                bindings for new platforms in seconds.</p>
             </div>
           </div>
         </div>
@@ -302,4 +349,5 @@ Columns:
 
   <script src="app.js?v=2"></script>
 </body>
+
 </html>

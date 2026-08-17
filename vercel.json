@@ -12,5 +12,11 @@
       "source": "/api/(.*)",
       "destination": "/api/index.ts"
     }
+  ],
+  "crons": [
+    {
+      "path": "/api/health/integrity-scan?sinceHours=24",
+      "schedule": "0 6 * * *"
+    }
   ]
 }

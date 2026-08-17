@@ -699,7 +699,7 @@ export class SalesforceAdapter extends BaseGRCAdapter {
     ratingLabel: string,
     justification: string,
     evidenceSummary: string,
-    auditTrail: string,   // ServiceNow-specific field; ignored on Salesforce
+    auditTrail: string,
     fingerprint: string
   ): Promise<boolean> {
     if (this.useLive) {
@@ -718,6 +718,16 @@ export class SalesforceAdapter extends BaseGRCAdapter {
           Risk__Assessment_Date__c: new Date().toISOString().split('T')[0]
         });
         console.log(`[Salesforce LIVE UPDATE] Updated Risk__Control_Assessment__c ${rowSysId} → ${ratingLabel}`);
+
+        // Create EMA audit trail record linked to this control assessment
+        if (auditTrail) {
+          try {
+            await this.createEMATrail(rowSysId, 'Risk__Control_Assessment__c', 'Control Effectiveness', auditTrail);
+          } catch (trailErr: any) {
+            console.warn(`[SalesforceAdapter] Failed to create EMA audit trail for control assessment ${rowSysId}: ${trailErr.message}`);
+            // Don't fail the whole write if audit trail fails
+          }
+        }
       } catch (e: any) {
         console.error(`[SalesforceAdapter] writeControlEffectiveness failed for ${rowSysId}: ${e.message}`);
         throw e;
@@ -745,8 +755,8 @@ export class SalesforceAdapter extends BaseGRCAdapter {
     score: number,
     ratingLabel: string,
     justification: string,
-    comment: string,      // plain text structured comment
-    auditTrail: string    // HTML audit trail (ServiceNow-specific; ignored here)
+    comment: string,
+    auditTrail: string
   ): Promise<boolean> {
     if (this.useLive) {
       try {
@@ -777,6 +787,16 @@ export class SalesforceAdapter extends BaseGRCAdapter {
         console.log(`[Salesforce LIVE UPDATE] Updated Risk__Risk_Assessment_Rating__c ${rowSysId}`);
         console.log(`  Rating: ${ratingLabel} | Band: ${bandData.band} | Best: ${bandData.bestCase} | Value: ${bandData.value} | Worst: ${bandData.worstCase}`);
         console.log(`  Justification: ${comment.substring(0, 200)}...`);
+
+        // Create EMA audit trail record linked to this rating assessment
+        if (auditTrail) {
+          try {
+            await this.createEMATrail(rowSysId, 'Risk__Risk_Assessment_Rating__c', 'Inherent Assessment', auditTrail);
+          } catch (trailErr: any) {
+            console.warn(`[SalesforceAdapter] Failed to create EMA audit trail for inherent rating ${rowSysId}: ${trailErr.message}`);
+            // Don't fail the whole write if audit trail fails
+          }
+        }
         return true;
       } catch (e: any) {
         console.error(`[SalesforceAdapter] writeInherentFactor failed for ${rowSysId}: ${e.message}`);
@@ -839,6 +859,46 @@ export class SalesforceAdapter extends BaseGRCAdapter {
     });
     console.log(`[Salesforce DB UPDATE] Created ${matchedControls.length} entries in Risk_Control_Mapping__c. Added AI feedback summary to Risk__c: ${riskSysId}`);
     return true;
+  }
+
+  // --------------------------------------------------------------------------
+  // createEMATrail — creates an audit trail record for agent execution
+  // --------------------------------------------------------------------------
+  private async createEMATrail(
+    recordSysId: string,
+    recordType: string,
+    assessmentType: string,
+    auditTrailHtml: string
+  ): Promise<void> {
+    try {
+      const token = await this.getAccessToken();
+      // Create a new EMA audit trail record linked to the assessment record
+      const payload = {
+        Risk__Assessment_Record_Id__c: recordSysId,
+        Risk__Assessment_Type__c: assessmentType,
+        Risk__Record_Type__c: recordType,
+        Risk__Audit_Trail_Details__c: auditTrailHtml,
+        Risk__Created_Date__c: new Date().toISOString()
+      };
+
+      const response = await axios.post(
+        `${this.instanceUrl}/services/data/v60.0/sobjects/Risk__EMA_Audit_Trail__c`,
+        payload,
+        {
+          headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+          timeout: 15000
+        }
+      );
+
+      console.log(`[SalesforceAdapter] Created EMA audit trail record ${response.data.id} for ${recordType} ${recordSysId}`);
+    } catch (e: any) {
+      // If the EMA audit trail object doesn't exist, just log a warning instead of failing
+      if (e.response?.status === 404 || e.message?.includes('sobject type')) {
+        console.warn(`[SalesforceAdapter] EMA audit trail object not found in Salesforce. Object may not be configured. Skipping trail creation.`);
+      } else {
+        throw e;
+      }
+    }
   }
 
   // --------------------------------------------------------------------------

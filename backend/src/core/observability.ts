@@ -2,6 +2,7 @@ import fs from 'fs';
 import path from 'path';
 import crypto from 'crypto';
 import { AsyncLocalStorage } from 'async_hooks';
+import { put, list, get } from '@vercel/blob';
 
 // ============================================================================
 // AI Observability — lightweight homegrown tracer
@@ -37,20 +38,23 @@ export interface Trace {
   spans: Span[];
 }
 
-// On Vercel (and other serverless runtimes) the filesystem is read-only
-// except for /tmp. Use /tmp for ephemeral persistence so the observability
-// system still works; on a local Express server use the normal data/ dir.
-const IS_SERVERLESS = !!(process.env.VERCEL || process.env.AWS_LAMBDA_FUNCTION_NAME);
-const DATA_DIR = IS_SERVERLESS ? '/tmp' : path.join(__dirname, '..', '..', 'data');
-const TRACES_PATH = IS_SERVERLESS
-  ? '/tmp/grc-traces.jsonl'
-  : path.join(DATA_DIR, 'traces.jsonl');
+// Persistence has two backends:
+// - Local dev: append-only JSONL file under data/ (unchanged from before).
+// - Vercel: individual JSON blobs in Vercel Blob storage, one per trace. NOT
+//   /tmp — Vercel's /tmp is wiped on every cold start and isn't guaranteed to
+//   survive between requests either, so scan/run history disappeared on every
+//   redeploy until this was in place. Blob storage is durable and survives
+//   redeploys, matching the "old scans should stay visible" requirement.
+const HAS_BLOB = !!process.env.BLOB_READ_WRITE_TOKEN;
+const DATA_DIR = path.join(__dirname, '..', '..', 'data');
+const TRACES_PATH = path.join(DATA_DIR, 'traces.jsonl');
+const BLOB_PREFIX = 'traces/';
 const RING_SIZE = 200;
 
 const storage = new AsyncLocalStorage<Trace>();
 const ring: Trace[] = [];
 
-function loadRecentFromDisk(): void {
+function loadRecentFromDiskSync(): void {
   try {
     if (!fs.existsSync(TRACES_PATH)) return;
     const lines = fs.readFileSync(TRACES_PATH, 'utf-8').trim().split('\n');
@@ -61,9 +65,52 @@ function loadRecentFromDisk(): void {
     console.warn(`[Observability] Could not load prior traces: ${e.message}`);
   }
 }
-loadRecentFromDisk();
 
-function persist(trace: Trace): void {
+async function loadRecentFromBlob(): Promise<void> {
+  try {
+    const { blobs } = await list({ prefix: BLOB_PREFIX, limit: RING_SIZE });
+    // Oldest first, so ring ends up in the same append order as live pushes.
+    const sorted = blobs.slice().sort((a, b) => new Date(a.uploadedAt).getTime() - new Date(b.uploadedAt).getTime());
+    const fetched = await Promise.all(sorted.map(async b => {
+      try {
+        const result = await get(b.pathname, { access: 'private' });
+        if (!result || result.statusCode !== 200) return null;
+        const text = await new Response(result.stream).text();
+        return JSON.parse(text) as Trace;
+      } catch {
+        return null; // one corrupt/missing blob shouldn't drop the rest of history
+      }
+    }));
+    for (const t of fetched) if (t) ring.push(t);
+  } catch (e: any) {
+    console.warn(`[Observability] Could not load prior traces from Blob: ${e.message}`);
+  }
+}
+
+// Hydrates the in-memory ring from durable storage exactly once per warm
+// instance — memoized so every withTrace/recentTraces/computeStats call
+// after the first just awaits an already-resolved promise.
+let hydratePromise: Promise<void> | null = null;
+function ensureHydrated(): Promise<void> {
+  if (!hydratePromise) {
+    hydratePromise = HAS_BLOB ? loadRecentFromBlob() : Promise.resolve(loadRecentFromDiskSync());
+  }
+  return hydratePromise;
+}
+
+async function persist(trace: Trace): Promise<void> {
+  if (HAS_BLOB) {
+    try {
+      await put(`${BLOB_PREFIX}${trace.traceId}.json`, JSON.stringify(trace), {
+        access: 'private',
+        contentType: 'application/json',
+        addRandomSuffix: false
+      });
+    } catch (e: any) {
+      console.warn(`[Observability] Failed to persist trace ${trace.traceId} to Blob: ${e.message}`);
+    }
+    return;
+  }
   try {
     fs.mkdirSync(DATA_DIR, { recursive: true });
     fs.appendFileSync(TRACES_PATH, JSON.stringify(trace) + '\n', 'utf-8');
@@ -74,6 +121,7 @@ function persist(trace: Trace): void {
 
 /** Runs fn inside a new trace context; ends + persists the trace when fn settles. */
 export async function withTrace<T>(kind: string, meta: Record<string, any>, fn: () => Promise<T>): Promise<T> {
+  await ensureHydrated();
   const trace: Trace = {
     traceId: crypto.randomBytes(8).toString('hex'),
     kind,
@@ -96,7 +144,7 @@ export async function withTrace<T>(kind: string, meta: Record<string, any>, fn: 
       trace.durationMs = Date.now() - t0;
       ring.push(trace);
       if (ring.length > RING_SIZE) ring.shift();
-      persist(trace);
+      await persist(trace);
     }
   });
 }
@@ -138,8 +186,10 @@ export async function span<T>(name: string, meta: Record<string, any>, fn: () =>
 // ----------------------------------------------------------------------------
 // Query API for the dashboard
 // ----------------------------------------------------------------------------
-export function recentTraces(limit: number = 20): Trace[] {
-  return ring.slice(-limit).reverse();
+export async function recentTraces(limit: number = 20, kind?: string): Promise<Trace[]> {
+  await ensureHydrated();
+  const pool = kind ? ring.filter(t => t.kind === kind) : ring;
+  return pool.slice(-limit).reverse();
 }
 
 export interface ObservabilityStats {
@@ -158,7 +208,8 @@ export interface ObservabilityStats {
   selfHeals: number;
 }
 
-export function computeStats(): ObservabilityStats {
+export async function computeStats(): Promise<ObservabilityStats> {
+  await ensureHydrated();
   const stats: ObservabilityStats = {
     totalRuns: 0, errorRuns: 0, avgRunMs: 0,
     llmCalls: 0, llmFallbacks: 0, llmAvgMs: 0,
