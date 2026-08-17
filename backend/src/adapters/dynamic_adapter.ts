@@ -421,20 +421,12 @@ export class DynamicAdapter extends BaseGRCAdapter {
     const riskRows = await this.querySOQL<any>(`SELECT Id FROM ${riskTable.sourceTableName} WHERE Id = '${candidateRiskId}' LIMIT 1`);
     if (riskRows.length === 0) return null;
 
-    // Duplicate-click guard: if today already produced an assessment for
-    // this risk whose rating rows are still unscored, reuse it instead of
-    // creating another.
-    // CreatedDate (system field, always populated) rather than the custom
-    // assessment-date field — the latter can be FLS-hidden for the
-    // integration user, in which case Salesforce silently drops it on create
-    // and a date-based filter never matches.
+    // Reuse today's existing assessment for this risk if one was created today
     const reusable = await this.querySOQL<any>(
-      `SELECT Id FROM Risk__Risk_Assessment__c WHERE Risk__Risk__c = '${candidateRiskId}' AND CreatedDate = TODAY ` +
-      `AND Id IN (SELECT Risk__Risk_Assessment__c FROM Risk__Risk_Assessment_Rating__c WHERE Risk__Mitigation__c = 'Inherent' AND Risk__Value__c = null) ` +
-      `ORDER BY CreatedDate DESC LIMIT 1`
+      `SELECT Id FROM Risk__Risk_Assessment__c WHERE Risk__Risk__c = '${candidateRiskId}' AND CreatedDate = TODAY ORDER BY CreatedDate DESC LIMIT 1`
     );
     if (reusable.length > 0) {
-      console.log(`[DynamicAdapter:${this.config.platformName}] Reusing today's unscored assessment ${reusable[0].Id} for risk ${candidateRiskId}.`);
+      console.log(`[DynamicAdapter:${this.config.platformName}] Reusing today's existing assessment ${reusable[0].Id} for risk ${candidateRiskId}.`);
       return { sysId: reusable[0].Id, riskSysId: candidateRiskId };
     }
 

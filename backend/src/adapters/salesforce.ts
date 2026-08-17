@@ -486,6 +486,15 @@ export class SalesforceAdapter extends BaseGRCAdapter {
         }
 
         if (isRiskId) {
+          // Check if an assessment created today already exists for this risk
+          const reusable = await this.querySOQL<any>(
+            `SELECT Id FROM Risk__Risk_Assessment__c WHERE Risk__Risk__c = '${instanceSysId}' AND CreatedDate = TODAY ORDER BY CreatedDate DESC LIMIT 1`
+          );
+          if (reusable.length > 0) {
+            console.log(`[Salesforce LIVE] Reusing today's existing Risk Assessment ${reusable[0].Id} for risk ${instanceSysId}`);
+            return { sysId: reusable[0].Id, riskSysId: instanceSysId };
+          }
+
           console.log(`[Salesforce LIVE] Detected grc__Risk__c ID: ${instanceSysId}. Creating a new Risk__Risk_Assessment__c record...`);
           const assessmentId = await this.restCreate('Risk__Risk_Assessment__c', {
             Risk__Risk__c: instanceSysId,
