@@ -821,6 +821,21 @@ export class SalesforceAdapter extends BaseGRCAdapter {
         };
         const bandData = bandMap[ratingLabel] || { band: String(score), bandNum: score, bestCase: score - 0.25, value: score, worstCase: score + 0.25 };
 
+        // Meaningful justification for 255-char field limit: use clean rationale truncated at sentence/word boundary
+        let cleanJustification = (justification || comment || '').trim();
+        cleanJustification = cleanJustification.replace(/^[🔍\s\S]*CONCLUSION:\s*/i, '').trim();
+
+        if (cleanJustification.length > 255) {
+          const truncated = cleanJustification.substring(0, 255);
+          const lastPeriod = Math.max(truncated.lastIndexOf('. '), truncated.lastIndexOf('.'));
+          if (lastPeriod > 80) {
+            cleanJustification = truncated.substring(0, lastPeriod + 1);
+          } else {
+            const lastSpace = truncated.lastIndexOf(' ');
+            cleanJustification = lastSpace > 0 ? truncated.substring(0, lastSpace) + '.' : truncated;
+          }
+        }
+
         // Update the child rating record with full scoring details
         await this.restUpdate('Risk__Risk_Assessment_Rating__c', rowSysId, {
           Risk__Band__c: bandData.band,
@@ -828,11 +843,11 @@ export class SalesforceAdapter extends BaseGRCAdapter {
           Risk__Best_Case__c: bandData.bestCase,
           Risk__Value__c: bandData.value,
           Risk__Worst_Case__c: bandData.worstCase,
-          Risk__Justification__c: comment.substring(0, 32768)
+          Risk__Justification__c: cleanJustification
         });
         console.log(`[Salesforce LIVE UPDATE] Updated Risk__Risk_Assessment_Rating__c ${rowSysId}`);
         console.log(`  Rating: ${ratingLabel} | Band: ${bandData.band} | Best: ${bandData.bestCase} | Value: ${bandData.value} | Worst: ${bandData.worstCase}`);
-        console.log(`  Justification: ${comment.substring(0, 200)}...`);
+        console.log(`  Justification: ${cleanJustification}`);
 
         // Create EMA audit trail record linked to this rating assessment
         if (auditTrail) {

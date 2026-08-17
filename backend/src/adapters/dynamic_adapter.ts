@@ -820,9 +820,29 @@ export class DynamicAdapter extends BaseGRCAdapter {
       console.warn(`[DynamicAdapter:${this.config.platformName}] No write-back fields detected for Factor table; skipping write for row ${rowSysId} (would have written rating '${ratingLabel}').`);
       return false;
     }
+    // Meaningful justification for field limit (255 chars for Risk__Justification__c)
+    let cleanJustification = (justification || comment || '').trim();
+    cleanJustification = cleanJustification.replace(/^[🔍\s\S]*CONCLUSION:\s*/i, '').trim();
+
+    const metadata = wh.justificationField
+      ? this.config.fieldMetadata?.find(fm => fm.sourceTableName === t.sourceTableName && fm.sourceFieldName === wh.justificationField)
+      : null;
+    const maxChars = metadata?.maxCharacters || 255;
+
+    if (cleanJustification.length > maxChars) {
+      const truncated = cleanJustification.substring(0, maxChars);
+      const lastPeriod = Math.max(truncated.lastIndexOf('. '), truncated.lastIndexOf('.'));
+      if (lastPeriod > 80) {
+        cleanJustification = truncated.substring(0, lastPeriod + 1);
+      } else {
+        const lastSpace = truncated.lastIndexOf(' ');
+        cleanJustification = lastSpace > 0 ? truncated.substring(0, lastSpace) + '.' : truncated;
+      }
+    }
+
     const data: Record<string, any> = {};
     if (wh.scoreField) data[wh.scoreField] = score;
-    if (wh.justificationField) data[wh.justificationField] = comment;
+    if (wh.justificationField) data[wh.justificationField] = cleanJustification;
 
     const ok = await this.restUpdate(t.sourceTableName, rowSysId, data);
     if (ok) {
