@@ -955,6 +955,29 @@ export class SalesforceAdapter extends BaseGRCAdapter {
   }
 
   // --------------------------------------------------------------------------
+  // writeObservabilityTrace — called by core agents at end of execution
+  // --------------------------------------------------------------------------
+  async writeObservabilityTrace(payload: {
+    agentName: string;
+    targetId: string;
+    outcome: string;
+    results?: any;
+    html: string;
+    riskSysId?: string;
+    assessmentNumber?: string;
+    summary?: string;
+  }): Promise<void> {
+    if (this.useLive) {
+      await this.createEMATrail(
+        payload.riskSysId || payload.targetId,
+        payload.agentName,
+        payload.agentName,
+        payload.html || payload.summary || ''
+      );
+    }
+  }
+
+  // --------------------------------------------------------------------------
   // writeFailure
   // --------------------------------------------------------------------------
   async writeFailure(rowSysId: string, reason: string): Promise<void> {
